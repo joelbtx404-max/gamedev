@@ -109,18 +109,56 @@ def build_agents(model_name: str) -> tuple[Agent, Agent]:
     """Create analysis and summary Agents using default Agents SDK configuration."""
 
     analysis_instructions = (
-        "You are a game analysis assistant that provides structured JSON data about gameplay. "
-        "Respond with ONLY a JSON object (no markdown, no extra text). "
-        "The JSON must have these fields: "
+        "You are a game analysis assistant that provides structured JSON about the on-screen Pokémon gameplay. "
+        "Identify the game state from the RetroArch window and output only the required JSON schema.\n\n"
+        "Agentic eagerness (max):\n"
+        "- Keep going until the frame is fully analyzed and relevant tools have been called; only finish when confident.\n"
+        "- Never hand back for clarification; decide the most reasonable assumption and proceed.\n"
+        "- If uncertainty arises, research (call tools) and continue.\n\n"
+        "Tool preambles (do not include in final JSON):\n"
+        "- Before calling tools, emit a brief tool preamble that: (1) rephrases the goal, (2) lists the tools you plan to call and why.\n"
+        "- As you call tools, keep concise progress updates.\n"
+        "- After tools finish, internally note what you completed.\n"
+        "- These preambles must be emitted via internal reasoning/status only; your final message must contain ONLY the JSON schema below.\n\n"
+        "Tool use policy (maximal coverage):\n"
+        "- Be proactive and thorough. When any Pokémon name is readable, CALL tools to gather comprehensive info.\n"
+        "- For every unique Pokémon name visible this frame, CALL fetch_pokemon_core(name). Additionally, you MAY CALL fetch_pokemon_stats([name]) to cross-check base stats.\n"
+        "- For every move name visible (menu options, move used text), CALL fetch_move_details(name).\n"
+        "- For all types involved in the matchup (derived from Pokémon results or visible text), CALL fetch_type_relations(type) to precompute effectiveness.\n"
+        "- For any ability shown or implied by battle text, CALL fetch_ability_details(name).\n"
+        "- Budget: up to 10 total tool calls per frame. Prefer over-calling to ensure completeness; avoid exact duplicate calls.\n"
+        "- If names are unreadable or absent, do not guess or call tools.\n"
+        "- Never include tool outputs in your final message.\n\n"
+        "Respond with ONLY a JSON object (no markdown, no extra text). The JSON must have these fields: "
         "game_name (string), scene (string), characters (array of {name, level, hp_current, hp_max, status}), "
         "environment (string), notable_events (string)."
     )
     summary_instructions = (
-        "You are a game progress summarizer that creates concise gameplay summaries. "
-        "Keep it to 2-3 sentences focusing on what happened, progress, battles/encounters, level ups, and location changes."
+        "You are a game progress summarizer. Create concise, information-dense summaries that reflect the analyzer’s tool-informed insights.\n\n"
+        "Preamble (internal only): begin by stating what you will summarize and which insights (types, abilities, moves) are relevant; do not include this in the final message.\n"
+        "Then write 2–3 sentences focusing on: what happened, progress, battles/encounters, level ups, location changes, and any type/ability advantages that shaped outcomes."
     )
 
-    analysis_agent = Agent(name="GameAnalyzer", instructions=analysis_instructions)
+    # Tooling: allow the analyzer to fetch Pokémon information when names are recognized.
+    from pokeapi_tool import (
+        fetch_pokemon_stats,
+        fetch_pokemon_core,
+        fetch_move_details,
+        fetch_type_relations,
+        fetch_ability_details,
+    )
+
+    analysis_agent = Agent(
+        name="GameAnalyzer",
+        instructions=analysis_instructions,
+        tools=[
+            fetch_pokemon_core,
+            fetch_pokemon_stats,  # fallback lightweight stats-only
+            fetch_move_details,
+            fetch_type_relations,
+            fetch_ability_details,
+        ],
+    )
     summary_agent = Agent(name="GameSummarizer", instructions=summary_instructions)
 
     return analysis_agent, summary_agent
@@ -140,16 +178,20 @@ def extract_final_output(run_result) -> str:
 
 
 def analyze_image(agent: Agent, image_path: Path, prompt: str) -> str:
+    # Use structured multimodal content so the image is not tokenized as text.
+    # This adheres to Agents SDK/Responses input item guidelines.
     b64 = encode_image_b64(image_path)
-    # Agents SDK supports 'message' or plain strings; pass a single user message string.
-    # Note: This embeds the image as a data URL in text. For true multimodal input, we can later
-    # switch to item references per the SDK docs.
+    user_message = {
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": prompt},
+            {"type": "input_image", "image_url": f"data:image/png;base64,{b64}", "detail": "high"},
+        ],
+    }
+
     run = Runner.run_sync(
         agent,
-        input=(
-            f"{prompt}\n\n"
-            f"Image (data URL): data:image/png;base64,{b64}"
-        ),
+        input=[user_message],
     )
     return extract_final_output(run)
 
@@ -178,11 +220,14 @@ def main():
     ensure_out_dir(cfg["out_dir"])
 
     analysis_agent, summary_agent = build_agents(cfg["model"])
+    # Analysis prompt tuned for maximal eagerness + preambles while preserving JSON-only final output.
     prompt = (
         "IMPORTANT: Analyze ONLY the RetroArch game window. Ignore any code editors, desktop elements, or other applications. "
-        "Focus exclusively on the game content displayed in RetroArch. "
-        "Respond with ONLY a JSON object (no markdown, no extra text). "
-        "The JSON must have these fields:\n"
+        "Focus exclusively on the game content displayed in RetroArch.\n"
+        "Before calling tools, emit a brief tool preamble (internal only): restate the goal and outline which tools you'll call. "
+        "Then, CALL tools proactively up to 10 total calls per frame: fetch_pokemon_core for each visible Pokémon (and optionally fetch_pokemon_stats to cross-check), fetch_move_details for each visible move, fetch_type_relations for involved types, and fetch_ability_details when shown or implied. "
+        "Do not include any preamble or tool outputs in your final message.\n\n"
+        "Respond with ONLY a JSON object (no markdown, no extra text). The JSON must have these fields:\n"
         "- game_name: string (e.g., 'Pokemon Black', 'Pokemon HeartGold')\n"
         "- scene: string (brief description: 'battle', 'overworld', 'menu', etc.)\n"
         "- characters: array of objects with {name: string, level: int, hp_current: int, hp_max: int, status: string}\n"
@@ -196,6 +241,8 @@ def main():
     print("Generating summary after every 3 captures\n")
 
     recent_analyses = []
+    # Cache fetched stats to avoid repeated API calls and follow PokeAPI fair use.
+    stats_cache: dict[str, dict] = {}
     capture_count = 0
 
     while True:
@@ -246,19 +293,38 @@ def main():
             timestamp = datetime.now().isoformat(timespec='seconds')
             if parsed_successfully and data:
                 print(f"[{timestamp}] Frame Analysis:\n{json.dumps(data, indent=2)}\n")
+
+                # Fetch PokeAPI stats for any newly discovered Pokémon names (once per name).
+                try:
+                    from pokeapi_tool import fetch_pokemon_stats_sync
+
+                    discovered = []
+                    for ch in (data.get("characters") or []):
+                        name = str(ch.get("name", "")).strip()
+                        if name and name not in stats_cache:
+                            discovered.append(name)
+                    if discovered:
+                        stats_result = fetch_pokemon_stats_sync(discovered)
+                        for nm, st in stats_result.items():
+                            stats_cache[nm] = st
+                        print("PokeAPI stats fetched:")
+                        print(json.dumps({k: stats_cache[k] for k in discovered}, indent=2))
+                        print()
+                except Exception as exc:
+                    print(f"PokeAPI stats fetch error: {exc}")
                 
                 # Track successful analyses
                 recent_analyses.append(data)
                 capture_count += 1
                 print(f"DEBUG: Capture count: {capture_count}")
                 
-                # Generate summary every 3 captures
-                if capture_count % 3 == 0:
+                # Generate summary every 10 captures
+                if capture_count % 10 == 0:
                     print("=" * 60)
-                    print(f"GENERATING SUMMARY OF LAST 3 FRAMES (Total captures: {capture_count})...")
+                    print(f"GENERATING SUMMARY OF LAST 10 FRAMES (Total captures: {capture_count})...")
                     print("=" * 60)
                     try:
-                        summary = generate_summary(summary_agent, recent_analyses[-3:])
+                        summary = generate_summary(summary_agent, recent_analyses[-10:])
                         summary_timestamp = datetime.now().isoformat(timespec='seconds')
                         print(f"[{summary_timestamp}] Summary:\n{summary}\n")
                         print("=" * 60 + "\n")
@@ -278,4 +344,3 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\nStopped.")
-

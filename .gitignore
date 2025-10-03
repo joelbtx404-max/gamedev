@@ -45,3 +45,7 @@ node_modules/
 
 # OS / Misc
 Thumbs.db
+
+# Exclude images
+static/images/
+*.png

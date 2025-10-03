@@ -1,0 +1,468 @@
+AgentsOpenAI Agents SDK TypeScript
+​
+The OpenAI Agents SDK for TypeScript enables you to build agentic AI apps in a lightweight, easy-to-use package with very few abstractions. It’s a production-ready upgrade of our previous experimentation for agents, Swarm, that’s also available in Python. The Agents SDK has a very small set of primitives:
+
+Agents, which are LLMs equipped with instructions and tools
+Handoffs, which allow agents to delegate to other agents for specific tasks
+Guardrails, which enable the inputs to agents to be validated
+In combination with TypeScript, these primitives are powerful enough to express complex relationships between tools and agents, and allow you to build real-world applications without a steep learning curve. In addition, the SDK comes with built-in tracing that lets you visualize and debug your agentic flows, as well as evaluate them and even fine-tune models for your application.
+
+The SDK has two driving design principles:
+
+Enough features to be worth using, but few enough primitives to make it quick to learn.
+Works great out of the box, but you can customize exactly what happens.
+Here are the main features of the SDK:
+
+Agent loop: Built-in agent loop that handles calling tools, sending results to the LLM, and looping until the LLM is done.
+TypeScript-first: Use built-in language features to orchestrate and chain agents, rather than needing to learn new abstractions.
+Handoffs: A powerful feature to coordinate and delegate between multiple agents.
+Guardrails: Run input validations and checks in parallel to your agents, breaking early if the checks fail.
+Function tools: Turn any TypeScript function into a tool, with automatic schema generation and Zod-powered validation.
+Tracing: Built-in tracing that lets you visualize, debug and monitor your workflows, as well as use the OpenAI suite of evaluation, fine-tuning and distillation tools.
+Realtime Agents: Build powerful voice agents including automatic interruption detection, context management, guardrails, and more.
+npm install @openai/agents zod@3
+Hello World
+import { Agent, run } from '@openai/agents';
+const agent = new Agent({
+  instructions: 'You are a helpful assistant',
+const result = await run(
+  'Write a haiku about recursion in programming.',
+console.log(result.finalOutput);
+// Functions calling themselves,
+// Infinite loop's dance.
+(If running this, ensure you set the OPENAI_API_KEY environment variable)
+
+export OPENAI_API_KEY=sk-...
+
+
+​
+Agents are the main building‑block of the OpenAI Agents SDK. An Agent is a Large Language Model (LLM) that has been configured with:
+
+Instructions – the system prompt that tells the model who it is and how it should respond.
+Model – which OpenAI model to call, plus any optional model tuning parameters.
+Tools – a list of functions or APIs the LLM can invoke to accomplish a task.
+Basic Agent definition
+import { Agent } from '@openai/agents';
+const agent = new Agent({
+  instructions: 'Always respond in haiku form.',
+  model: 'gpt-5-nano', // optional – falls back to the default model
+The rest of this page walks through every Agent feature in more detail.
+
+The Agent constructor takes a single configuration object. The most commonly‑used properties are shown below.
+
+Property	Required	Description
+name	yes	A short human‑readable identifier.
+instructions	yes	System prompt (string or function – see Dynamic instructions).
+model	no	Model name or a custom Model implementation.
+modelSettings	no	Tuning parameters (temperature, top_p, etc.). If the properties you need aren’t at the top level, you can include them under providerData.
+tools	no	Array of Tool instances the model can call.
+Agent with tools
+import { Agent, tool } from '@openai/agents';
+const getWeather = tool({
+  description: 'Return the weather for a given city.',
+  parameters: z.object({ city: z.string() }),
+  async execute({ city }) {
+    return `The weather in ${city} is sunny.`;
+const agent = new Agent({
+  instructions: 'You are a helpful weather bot.',
+Agents are generic on their context type – i.e. Agent<TContext, TOutput>. The context is a dependency‑injection object that you create and pass to Runner.run(). It is forwarded to every tool, guardrail, handoff, etc. and is useful for storing state or providing shared services (database connections, user metadata, feature flags, …).
+
+Agent with context
+import { Agent } from '@openai/agents';
+  deliveryStatus: string;
+  // this function can be used within tools
+  fetchPurchases(): Promise<Purchase[]>;
+const agent = new Agent<UserContext>({
+  name: 'Personal shopper',
+  instructions: 'Recommend products the user will love.',
+import { run } from '@openai/agents';
+const result = await run(agent, 'Find me a new pair of running shoes', {
+  context: { uid: 'abc', isProUser: true, fetchPurchases: async () => [] },
+By default, an Agent returns plain text (string). If you want the model to return a structured object you can specify the outputType property. The SDK accepts:
+
+A Zod schema (z.object({...})).
+Any JSON‑schema‑compatible object.
+Structured output with Zod
+import { Agent } from '@openai/agents';
+const CalendarEvent = z.object({
+  participants: z.array(z.string()),
+const extractor = new Agent({
+  name: 'Calendar extractor',
+  instructions: 'Extract calendar events from the supplied text.',
+  outputType: CalendarEvent,
+When outputType is provided, the SDK automatically uses structured outputs instead of plain text.
+
+Multi-agent system design patterns
+
+There are many ways to compose agents together. Two patterns we regularly see in production apps are:
+
+Manager (agents as tools) – a central agent owns the conversation and invokes specialized agents that are exposed as tools.
+Handoffs – the initial agent delegates the entire conversation to a specialist once it has identified the user’s request.
+These approaches are complementary. Managers give you a single place to enforce guardrails or rate limits, while handoffs let each agent focus on a single task without retaining control of the conversation.
+
+Manager (agents as tools)
+
+In this pattern the manager never hands over control—the LLM uses the tools and the manager summarizes the final answer. Read more in the tools guide.
+
+Agents as tools
+import { Agent } from '@openai/agents';
+const bookingAgent = new Agent({
+  name: 'Booking expert',
+  instructions: 'Answer booking questions and modify reservations.',
+const refundAgent = new Agent({
+  instructions: 'Help customers process refunds and credits.',
+const customerFacingAgent = new Agent({
+  name: 'Customer-facing agent',
+    'Talk to the user directly. When they need booking or refund help, call the matching tool.',
+    bookingAgent.asTool({
+      toolName: 'booking_expert',
+      toolDescription: 'Handles booking questions and requests.',
+      toolName: 'refund_expert',
+      toolDescription: 'Handles refund questions and requests.',
+With handoffs the triage agent routes requests, but once a handoff occurs the specialist agent owns the conversation until it produces a final output. This keeps prompts short and lets you reason about each agent independently. Learn more in the handoffs guide.
+
+Agent with handoffs
+import { Agent } from '@openai/agents';
+const bookingAgent = new Agent({
+  instructions: 'Help users with booking requests.',
+const refundAgent = new Agent({
+  instructions: 'Process refund requests politely and efficiently.',
+// Use Agent.create method to ensure the finalOutput type considers handoffs
+const triageAgent = Agent.create({
+  instructions: `Help the user with their questions.
+  If the user asks about booking, hand off to the booking agent.
+  If the user asks about refunds, hand off to the refund agent.`.trimStart(),
+  handoffs: [bookingAgent, refundAgent],
+instructions can be a function instead of a string. The function receives the current RunContext and the Agent instance and can return a string or a Promise<string>.
+
+Agent with dynamic instructions
+import { Agent, RunContext } from '@openai/agents';
+function buildInstructions(runContext: RunContext<UserContext>) {
+  return `The user's name is ${runContext.context.name}. Be extra friendly!`;
+const agent = new Agent<UserContext>({
+  name: 'Personalized helper',
+  instructions: buildInstructions,
+Both synchronous and async functions are supported.
+
+For advanced use‑cases you can observe the Agent lifecycle by listening on events. To learn what’s available, refer to agent hook event names listed here.
+
+Agent with lifecycle hooks
+import { Agent } from '@openai/agents';
+const agent = new Agent({
+  instructions: 'Explain things thoroughly.',
+agent.on('agent_start', (ctx, agent) => {
+  console.log(`[${agent.name}] started`);
+agent.on('agent_end', (ctx, output) => {
+  console.log(`[agent] produced:`, output);
+Guardrails allow you to validate or transform user input and agent output. They are configured via the inputGuardrails and outputGuardrails arrays. See the guardrails guide for details.
+
+Need a slightly modified version of an existing agent? Use the clone() method, which returns an entirely new Agent instance.
+
+Cloning Agents
+import { Agent } from '@openai/agents';
+const pirateAgent = new Agent({
+  instructions: 'Respond like a pirate – lots of “Arrr!”',
+const robotAgent = pirateAgent.clone({
+  instructions: 'Respond like a robot – be precise and factual.',
+Supplying tools doesn’t guarantee the LLM will call one. You can force tool use with modelSettings.tool_choice:
+
+'auto' (default) – the LLM decides whether to use a tool.
+'required' – the LLM must call a tool (it can choose which one).
+'none' – the LLM must not call a tool.
+A specific tool name, e.g. 'calculator' – the LLM must call that particular tool.
+Forcing tool use
+import { Agent, tool } from '@openai/agents';
+const calculatorTool = tool({
+  description: 'Use this tool to answer questions about math problems.',
+  parameters: z.object({ question: z.string() }),
+  execute: async (input) => {
+    throw new Error('TODO: implement this');
+const agent = new Agent({
+  name: 'Strict tool user',
+  instructions: 'Always answer using the calculator tool.',
+  tools: [calculatorTool],
+  modelSettings: { toolChoice: 'auto' },
+Preventing infinite loops
+
+After a tool call the SDK automatically resets tool_choice back to 'auto'. This prevents the model from entering an infinite loop where it repeatedly tries to call the tool. You can override this behavior via the resetToolChoice flag or by configuring toolUseBehavior:
+
+'run_llm_again' (default) – run the LLM again with the tool result.
+'stop_on_first_tool' – treat the first tool result as the final answer.
+{ stopAtToolNames: ['my_tool'] } – stop when any of the listed tools is called.
+(context, toolResults) => ... – custom function returning whether the run should finish.
+const agent = new Agent({
+  toolUseBehavior: 'stop_on_first_tool',
+Learn how to run agents.
+Dive into tools, guardrails, and models.
+Explore the full TypeDoc reference under @openai/agents in the sidebar.
+
+Running agents
+​
+Agents do nothing by themselves – you run them with the Runner class or the run() utility.
+
+Simple run
+import { Agent, run } from '@openai/agents';
+const agent = new Agent({
+  instructions: 'You are a helpful assistant',
+const result = await run(
+  'Write a haiku about recursion in programming.',
+console.log(result.finalOutput);
+// Functions calling themselves,
+// Infinite loop's dance.
+When you don’t need a custom runner, you can also use the run() utility, which runs a singleton default Runner instance.
+
+Alternatively, you can create your own runner instance:
+
+Simple run
+import { Agent, Runner } from '@openai/agents';
+const agent = new Agent({
+  instructions: 'You are a helpful assistant',
+// You can pass custom configuration to the runner
+const runner = new Runner();
+const result = await runner.run(
+  'Write a haiku about recursion in programming.',
+console.log(result.finalOutput);
+// Functions calling themselves,
+// Infinite loop's dance.
+After running your agent, you will receive a result object that contains the final output and the full history of the run.
+
+When you use the run method in Runner, you pass in a starting agent and input. The input can either be a string (which is considered a user message), or a list of input items, which are the items in the OpenAI Responses API.
+
+The runner then runs a loop:
+
+Call the current agent’s model with the current input.
+Inspect the LLM response.
+Final output → return.
+Handoff → switch to the new agent, keep the accumulated conversation history, go to 1.
+Tool calls → execute tools, append their results to the conversation, go to 1.
+Throw MaxTurnsExceededError once maxTurns is reached.
+Note
+
+The rule for whether the LLM output is considered as a “final output” is that it produces text output with the desired type, and there are no tool calls.
+
+Create a Runner when your app starts and reuse it across requests. The instance stores global configuration such as model provider and tracing options. Only create another Runner if you need a completely different setup. For simple scripts you can also call run() which uses a default runner internally.
+
+The input to the run() method is an initial agent to start the run on, input for the run and a set of options.
+
+The input can either be a string (which is considered a user message), or a list of input items, or a RunState object in case you are building a human-in-the-loop agent.
+
+The additional options are:
+
+Option	Default	Description
+stream	false	If true the call returns a StreamedRunResult and emits events as they arrive from the model.
+context	–	Context object forwarded to every tool / guardrail / handoff. Learn more in the context guide.
+maxTurns	10	Safety limit – throws MaxTurnsExceededError when reached.
+signal	–	AbortSignal for cancellation.
+Streaming allows you to additionally receive streaming events as the LLM runs. Once the stream is started, the StreamedRunResult will contain the complete information about the run, including all the new outputs produces. You can iterate over the streaming events using a for await loop. Read more in the streaming guide.
+
+If you are creating your own Runner instance, you can pass in a RunConfig object to configure the runner.
+
+Field	Type	Purpose
+model	string | Model	Force a specific model for all agents in the run.
+modelProvider	ModelProvider	Resolves model names – defaults to the OpenAI provider.
+modelSettings	ModelSettings	Global tuning parameters that override per‑agent settings.
+handoffInputFilter	HandoffInputFilter	Mutates input items when performing handoffs (if the handoff itself doesn’t already define one).
+inputGuardrails	InputGuardrail[]	Guardrails applied to the initial user input.
+outputGuardrails	OutputGuardrail[]	Guardrails applied to the final output.
+tracingDisabled	boolean	Disable OpenAI Tracing completely.
+traceIncludeSensitiveData	boolean	Exclude LLM/tool inputs & outputs from traces while still emitting spans.
+workflowName	string	Appears in the Traces dashboard – helps group related runs.
+traceId / groupId	string	Manually specify the trace or group ID instead of letting the SDK generate one.
+traceMetadata	Record<string, any>	Arbitrary metadata to attach to every span.
+Conversations / chat threads
+
+Each call to runner.run() (or run() utility) represents one turn in your application-level conversation. You choose how much of the RunResult you show the end‑user – sometimes only finalOutput, other times every generated item.
+
+Example of carrying over the conversation history
+import { Agent, run } from '@openai/agents';
+import type { AgentInputItem } from '@openai/agents';
+let thread: AgentInputItem[] = [];
+const agent = new Agent({
+async function userSays(text: string) {
+  const result = await run(
+    thread.concat({ role: 'user', content: text }),
+  thread = result.history; // Carry over history + newly generated items
+  return result.finalOutput;
+await userSays('What city is the Golden Gate Bridge in?');
+await userSays('What state is it in?');
+See the chat example for an interactive version.
+
+The SDK throws a small set of errors you can catch:
+
+MaxTurnsExceededError – maxTurns reached.
+ModelBehaviorError – model produced invalid output (e.g. malformed JSON, unknown tool).
+InputGuardrailTripwireTriggered / OutputGuardrailTripwireTriggered – guardrail violations.
+GuardrailExecutionError – guardrails failed to complete.
+ToolCallError – any of function tool calls failed.
+UserError – any error thrown based on configuration or user input.
+All extend the base AgentsError class, which could provide the state property to access the current run state.
+
+Here is an example code that handles GuardrailExecutionError:
+
+Guardrail execution error
+  GuardrailExecutionError,
+  InputGuardrailTripwireTriggered,
+const guardrailAgent = new Agent({
+  name: 'Guardrail check',
+  instructions: 'Check if the user is asking you to do their math homework.',
+    isMathHomework: z.boolean(),
+    reasoning: z.string(),
+const unstableGuardrail: InputGuardrail = {
+  name: 'Math Homework Guardrail (unstable)',
+    throw new Error('Something is wrong!');
+const fallbackGuardrail: InputGuardrail = {
+  name: 'Math Homework Guardrail (fallback)',
+  execute: async ({ input, context }) => {
+    const result = await run(guardrailAgent, input, { context });
+      outputInfo: result.finalOutput,
+      tripwireTriggered: result.finalOutput?.isMathHomework ?? false,
+const agent = new Agent({
+  name: 'Customer support agent',
+    'You are a customer support agent. You help customers with their questions.',
+  inputGuardrails: [unstableGuardrail],
+    const input = 'Hello, can you help me solve for x: 2x + 3 = 11?';
+    const result = await run(agent, input);
+    console.log(result.finalOutput);
+    if (e instanceof GuardrailExecutionError) {
+      console.error(`Guardrail execution failed: ${e}`);
+      // If you want to retry the execution with different settings,
+      // you can reuse the runner's latest state this way:
+          agent.inputGuardrails = [fallbackGuardrail]; // fallback
+          const result = await run(agent, e.state);
+          console.log(result.finalOutput);
+          if (ee instanceof InputGuardrailTripwireTriggered) {
+            console.log('Math homework guardrail tripped');
+main().catch(console.error);
+When you run the above example, you will see the following output:
+
+Guardrail execution failed: Error: Input guardrail failed to complete: Error: Something is wrong!
+Math homework guardrail tripped
+Learn how to configure models.
+Provide your agents with tools.
+Add guardrails or tracing for production readiness.
+
+Tools
+​
+ Summarize
+​
+Tools let an Agent take actions – fetch data, call external APIs, execute code, or even use a computer. The JavaScript/TypeScript SDK supports four categories:
+
+Hosted tools – run alongside the model on OpenAI servers. (web search, file search, computer use, code interpreter, image generation)
+Function tools – wrap any local function with a JSON schema so the LLM can call it.
+Agents as tools – expose an entire Agent as a callable tool.
+Local MCP servers – attach a Model Context Protocol server running on your machine.
+When you use the OpenAIResponsesModel you can add the following built‑in tools:
+
+Tool	Type string	Purpose
+Web search	'web_search'	Internet search.
+File / retrieval search	'file_search'	Query vector stores hosted on OpenAI.
+Computer use	'computer'	Automate GUI interactions.
+Code Interpreter	'code_interpreter'	Run code in a sandboxed environment.
+Image generation	'image_generation'	Generate images based on text.
+Hosted tools
+import { Agent, webSearchTool, fileSearchTool } from '@openai/agents';
+const agent = new Agent({
+  name: 'Travel assistant',
+  tools: [webSearchTool(), fileSearchTool('VS_ID')],
+The exact parameter sets match the OpenAI Responses API – refer to the official documentation for advanced options like rankingOptions or semantic filters.
+
+You can turn any function into a tool with the tool() helper.
+
+Function tool with Zod parameters
+import { tool } from '@openai/agents';
+const getWeatherTool = tool({
+  description: 'Get the weather for a given city',
+  parameters: z.object({ city: z.string() }),
+  async execute({ city }) {
+    return `The weather in ${city} is sunny.`;
+Field	Required	Description
+name	No	Defaults to the function name (e.g., get_weather).
+description	Yes	Clear, human-readable description shown to the LLM.
+parameters	Yes	Either a Zod schema or a raw JSON schema object. Zod parameters automatically enable strict mode.
+strict	No	When true (default), the SDK returns a model error if the arguments don’t validate. Set to false for fuzzy matching.
+execute	Yes	(args, context) => string | Promise<string>– your business logic. The optional second parameter is theRunContext.
+errorFunction	No	Custom handler (context, error) => string for transforming internal errors into a user-visible string.
+Non‑strict JSON‑schema tools
+
+If you need the model to guess invalid or partial input you can disable strict mode when using raw JSON schema:
+
+Non-strict JSON schema tools
+import { tool } from '@openai/agents';
+interface LooseToolInput {
+  description: 'Echo input; be forgiving about typos',
+    properties: { text: { type: 'string' } },
+    additionalProperties: true,
+  execute: async (input) => {
+    // because strict is false we need to do our own verification
+    if (typeof input !== 'object' || input === null || !('text' in input)) {
+      return 'Invalid input. Please try again';
+    return (input as LooseToolInput).text;
+Sometimes you want an Agent to assist another Agent without fully handing off the conversation. Use agent.asTool():
+
+Agents as tools
+import { Agent } from '@openai/agents';
+const summarizer = new Agent({
+  instructions: 'Generate a concise summary of the supplied text.',
+const summarizerTool = summarizer.asTool({
+  toolName: 'summarize_text',
+  toolDescription: 'Generate a concise summary of the supplied text.',
+const mainAgent = new Agent({
+  name: 'Research assistant',
+  tools: [summarizerTool],
+Under the hood the SDK:
+
+Creates a function tool with a single input parameter.
+Runs the sub‑agent with that input when the tool is called.
+Returns either the last message or the output extracted by customOutputExtractor.
+When you run an agent as a tool, Agents SDK creates a runner with the defualt settings and run the agent with it within the function execution. If you want to provide any properties of runConfig or runOptions, you can pass them to the asTool() method to customize the runner’s behavior.
+
+You can expose tools via Model Context Protocol (MCP) servers and attach them to an agent. For instance, you can use MCPServerStdio to spawn and connect to the stdio MCP server:
+
+Local MCP server
+import { Agent, MCPServerStdio } from '@openai/agents';
+const server = new MCPServerStdio({
+  fullCommand: 'npx -y @modelcontextprotocol/server-filesystem ./sample_files',
+const agent = new Agent({
+See filesystem-example.ts for a complete example. Also, if you’re looking for a comprehensitve guide for MCP server tool integration, refer to MCP guide for details.
+
+Refer to the Agents guide for controlling when and how a model must use tools (tool_choice, toolUseBehavior, etc.).
+
+Short, explicit descriptions – describe what the tool does and when to use it.
+Validate inputs – use Zod schemas for strict JSON validation where possible.
+Avoid side‑effects in error handlers – errorFunction should return a helpful string, not throw.
+One responsibility per tool – small, composable tools lead to better model reasoning.
+Learn about forcing tool use.
+Add guardrails to validate tool inputs or outputs.
+Dive into the TypeDoc reference for tool() and the various hosted tool types.
+
+Orchestrating multiple agents
+​
+ Summarize
+​
+Orchestration refers to the flow of agents in your app. Which agents run, in what order, and how do they decide what happens next? There are two main ways to orchestrate agents:
+
+Allowing the LLM to make decisions: this uses the intelligence of an LLM to plan, reason, and decide on what steps to take based on that.
+Orchestrating via code: determining the flow of agents via your code.
+You can mix and match these patterns. Each has their own tradeoffs, described below.
+
+An agent is an LLM equipped with instructions, tools and handoffs. This means that given an open-ended task, the LLM can autonomously plan how it will tackle the task, using tools to take actions and acquire data, and using handoffs to delegate tasks to sub-agents. For example, a research agent could be equipped with tools like:
+
+Web search to find information online
+File search and retrieval to search through proprietary data and connections
+Computer use to take actions on a computer
+Code execution to do data analysis
+Handoffs to specialized agents that are great at planning, report writing and more.
+This pattern is great when the task is open-ended and you want to rely on the intelligence of an LLM. The most important tactics here are:
+
+Invest in good prompts. Make it clear what tools are available, how to use them, and what parameters it must operate within.
+Monitor your app and iterate on it. See where things go wrong, and iterate on your prompts.
+Allow the agent to introspect and improve. For example, run it in a loop, and let it critique itself; or, provide error messages and let it improve.
+Have specialized agents that excel in one task, rather than having a general purpose agent that is expected to be good at anything.
+Invest in evals. This lets you train your agents to improve and get better at tasks.
+While orchestrating via LLM is powerful, orchestrating via code makes tasks more deterministic and predictable, in terms of speed, cost and performance. Common patterns here are:
+
+Using structured outputs to generate well formed data that you can inspect with your code. For example, you might ask an agent to classify the task into a few categories, and then pick the next agent based on the category.
+Chaining multiple agents by transforming the output of one into the input of the next. You can decompose a task like writing a blog post into a series of steps - do research, write an outline, write the blog post, critique it, and then improve it.
+Running the agent that performs the task in a while loop with an agent that evaluates and provides feedback, until the evaluator says the output passes certain criteria.
+Running multiple agents in parallel, e.g. via JavaScript primitives like Promise.all. This is useful for speed when you have multiple tasks that don’t depend on each other.
+We have a number of examples in examples/agent-patterns.

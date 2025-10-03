@@ -7,7 +7,7 @@ A Python tool that captures screenshots from RetroArch gameplay and uses OpenAI'
 - 🎮 Automatic RetroArch window capture (macOS)
 - 🤖 AI-powered game state analysis using OpenAI Vision API
 - 📊 Structured JSON output for easy parsing
-- 📝 Automatic summaries every 3 captures
+- 📝 Automatic summaries every 10 captures
 - ⚙️ Configurable capture intervals and models
 - 🔌 Compatible with OpenAI and OpenAI-compatible APIs (xAI, etc.)
 
@@ -73,8 +73,8 @@ Edit `.env` file with these options:
 }
 ```
 
-### Summary (Every 3 Captures)
-After every 3 successful captures, the system generates a concise summary of gameplay progression focusing on battles, level ups, and location changes.
+### Summary (Every 10 Captures)
+After every 10 successful captures, the system generates a concise summary of gameplay progression focusing on battles, level ups, and location changes.
 
 ## Usage Examples
 
