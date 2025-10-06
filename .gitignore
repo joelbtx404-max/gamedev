@@ -46,6 +46,5 @@ node_modules/
 # OS / Misc
 Thumbs.db
 
-# Exclude images
+# Capture artifacts
 static/images/
-*.png
