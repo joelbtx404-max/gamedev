@@ -48,3 +48,7 @@ Thumbs.db
 
 # Capture artifacts
 static/images/
+
+# local files
+demofrontend/
+reference/

@@ -1,16 +1,24 @@
+import argparse
+import asyncio
 import base64
 import json
 import os
+import queue
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, Optional
 
 from dotenv import load_dotenv
+from flask import Flask, Response, render_template, stream_with_context
+from pokeapi_tool import fetch_pokemon_profile, pull_latest_pokemon_calls
 
 try:
-    from agents import Agent, Runner
+    from agents import Agent, ModelSettings, Runner
 except Exception as exc:  # pragma: no cover
     print("openai-agents is required. pip install openai-agents", file=sys.stderr)
     raise
@@ -18,13 +26,24 @@ except Exception as exc:  # pragma: no cover
 
 def load_config():
     load_dotenv()
+    port_env = os.getenv("STREAM_UI_PORT") or os.getenv("WEB_APP_PORT")
+    if port_env:
+        try:
+            ui_port = int(port_env)
+        except ValueError as exc:  # pragma: no cover - configuration error
+            raise RuntimeError("STREAM_UI_PORT/WEB_APP_PORT must be an integer") from exc
+    else:
+        ui_port = 5050
+
     cfg = {
-        "interval": float(os.getenv("SCREENSHOT_INTERVAL_SECONDS", "5")),
+        "interval": float(os.getenv("SCREENSHOT_INTERVAL_SECONDS", "2")),
         "app_name": os.getenv("CAPTURE_SOURCE", "RetroArch"),
         "model": os.getenv("MODEL", "gpt-5"),
         "api_key": os.getenv("OPENAI_API_KEY"),
         "base_url": os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
         "out_dir": Path(os.getenv("SCREENSHOTS_DIR", str(Path(__file__).resolve().parent / "static" / "images"))).resolve(),
+        "ui_host": os.getenv("STREAM_UI_HOST", "0.0.0.0"),
+        "ui_port": ui_port,
     }
     missing = [k for k in ("api_key",) if not cfg[k]]
     if missing:
@@ -32,8 +51,19 @@ def load_config():
     return cfg
 
 
-def ensure_out_dir(path: Path) -> None:
+def ensure_out_dir(path: Path, clear: bool = False) -> None:
+    """Ensure the screenshot output directory exists and optionally purge old captures."""
     path.mkdir(parents=True, exist_ok=True)
+    if not clear:
+        return
+    for item in path.iterdir():
+        try:
+            if item.is_file() or item.is_symlink():
+                item.unlink()
+            else:
+                shutil.rmtree(item)
+        except Exception as exc:  # pragma: no cover
+            print(f"Failed to remove stale capture '{item}': {exc}")
 
 
 def osascript_get_bounds(app_name: str) -> tuple[int, int, int, int] | None:
@@ -111,58 +141,212 @@ def build_agents(model_name: str) -> tuple[Agent, Agent]:
     analysis_instructions = (
         "You are a game analysis assistant that provides structured JSON about the on-screen Pokémon gameplay. "
         "Identify the game state from the RetroArch window and output only the required JSON schema.\n\n"
-        "Agentic eagerness (max):\n"
-        "- Keep going until the frame is fully analyzed and relevant tools have been called; only finish when confident.\n"
-        "- Never hand back for clarification; decide the most reasonable assumption and proceed.\n"
-        "- If uncertainty arises, research (call tools) and continue.\n\n"
-        "Tool preambles (do not include in final JSON):\n"
-        "- Before calling tools, emit a brief tool preamble that: (1) rephrases the goal, (2) lists the tools you plan to call and why.\n"
-        "- As you call tools, keep concise progress updates.\n"
-        "- After tools finish, internally note what you completed.\n"
-        "- These preambles must be emitted via internal reasoning/status only; your final message must contain ONLY the JSON schema below.\n\n"
-        "Tool use policy (maximal coverage):\n"
-        "- Be proactive and thorough. When any Pokémon name is readable, CALL tools to gather comprehensive info.\n"
-        "- For every unique Pokémon name visible this frame, CALL fetch_pokemon_core(name). Additionally, you MAY CALL fetch_pokemon_stats([name]) to cross-check base stats.\n"
-        "- For every move name visible (menu options, move used text), CALL fetch_move_details(name).\n"
-        "- For all types involved in the matchup (derived from Pokémon results or visible text), CALL fetch_type_relations(type) to precompute effectiveness.\n"
-        "- For any ability shown or implied by battle text, CALL fetch_ability_details(name).\n"
-        "- Budget: up to 10 total tool calls per frame. Prefer over-calling to ensure completeness; avoid exact duplicate calls.\n"
-        "- If names are unreadable or absent, do not guess or call tools.\n"
-        "- Never include tool outputs in your final message.\n\n"
+        "<persistence>\n"
+        "- You are an agent; continue until the frame is fully analyzed and the JSON schema is ready.\n"
+        "- Finalize only after the battle flow and verification checks below are satisfied.\n"
+        "- When uncertain, make the most reasonable inference from the frame or fetched data and record any uncertainty inside the JSON text fields.\n"
+        "- Do not ask the user for clarification; document assumptions, act on them, and adjust if new evidence appears.\n"
+        "</persistence>\n\n"
+        "<context_gathering>\n"
+        "Goal: Capture enough frame context to populate every JSON field accurately.\n\n"
+        "Method:\n"
+        "- Start with a broad scan to decide whether the scene is a battle.\n"
+        "- Sweep the UI to read Pokémon names, HP bars, levels, and status icons before zooming into details.\n"
+        "- Reuse cached knowledge from prior frames when the same Pokémon reappears, but revalidate HP and status each frame.\n"
+        "- Avoid redundant passes; if a detail stays unreadable, flag it instead of looping indefinitely.\n\n"
+        "Early stop criteria:\n"
+        "- Battle state classification is complete.\n"
+        "- Each combatant is named or explicitly marked unreadable.\n"
+        "- Required HP and status details are captured or noted as unknown.\n\n"
+        "Escalate once:\n"
+        "- If names, HP, or status indicators conflict, run one focused re-check before moving on.\n\n"
+        "Depth:\n"
+        "- Track only details needed for the schema (names, levels, HP fractions, status effects, notable events).\n\n"
+        "Loop:\n"
+        "- Frame scan -> minimal plan -> execute tool calls -> fill JSON.\n"
+        "- Revisit recognition only if verification fails or new uncertainty appears.\n"
+        "</context_gathering>\n\n"
+        "<tool_preambles>\n"
+        "- Before the first tool call, restate the battle analysis goal and list the Pokémon you will query with fetch_pokemon_profile.\n"
+        "- Outline a concise plan for this frame covering battle detection, roster capture, tool calls, and JSON assembly.\n"
+        "- When issuing each tool call, note internally which Pokémon you are enriching and why.\n"
+        "- Keep these preambles internal; the final assistant message must remain pure JSON.\n"
+        "- After tool calls finish, confirm internally that the plan is complete before composing the JSON.\n"
+        "</tool_preambles>\n\n"
+        "<verification>\n"
+        "- Confirm every Pokémon name in the JSON triggered exactly one fetch_pokemon_profile call this frame or was marked unreadable.\n"
+        "- Validate that the JSON matches the schema exactly with no extra keys or narrative text.\n"
+        "- Re-check HP and status entries against the screenshot before finalizing.\n"
+        "</verification>\n\n"
+        "<efficiency>\n"
+        "- Operate decisively: avoid duplicate tool calls and ignore UI elements unrelated to the schema.\n"
+        "- Prefer action over indecisive loops; once checks pass, finalize promptly.\n"
+        "</efficiency>\n\n"
+        "Battle flow you MUST follow:\n"
+        "1. Detect whether the frame is a battle.\n"
+        "2. List every clearly readable Pokémon name participating in the battle.\n"
+        "3. For each identified Pokémon, call fetch_pokemon_profile(name) exactly once during this frame. No other tool calls are available.\n"
+        "4. Integrate the fetched data (stats, types, abilities) into your reasoning before writing the final JSON.\n\n"
+        "Tool rule: fetch_pokemon_profile is the ONLY tool available (budget 10 calls per frame). Never include tool outputs in your final message.\n\n"
         "Respond with ONLY a JSON object (no markdown, no extra text). The JSON must have these fields: "
         "game_name (string), scene (string), characters (array of {name, level, hp_current, hp_max, status}), "
         "environment (string), notable_events (string)."
     )
     summary_instructions = (
-        "You are a game progress summarizer. Create concise, information-dense summaries that reflect the analyzer’s tool-informed insights.\n\n"
-        "Preamble (internal only): begin by stating what you will summarize and which insights (types, abilities, moves) are relevant; do not include this in the final message.\n"
-        "Then write 2–3 sentences focusing on: what happened, progress, battles/encounters, level ups, location changes, and any type/ability advantages that shaped outcomes."
-    )
-
-    # Tooling: allow the analyzer to fetch Pokémon information when names are recognized.
-    from pokeapi_tool import (
-        fetch_pokemon_stats,
-        fetch_pokemon_core,
-        fetch_move_details,
-        fetch_type_relations,
-        fetch_ability_details,
+        "You are a game progress summarizer. Produce 2–3 sentences highlighting the battle context and referencing any Pokémon stats, types, or abilities fetched via fetch_pokemon_profile that influenced the outcome."
     )
 
     analysis_agent = Agent(
         name="GameAnalyzer",
         instructions=analysis_instructions,
-        tools=[
-            fetch_pokemon_core,
-            fetch_pokemon_stats,  # fallback lightweight stats-only
-            fetch_move_details,
-            fetch_type_relations,
-            fetch_ability_details,
-        ],
+        tools=[fetch_pokemon_profile],
+        model_settings=ModelSettings(
+            tool_choice="required",
+        ),
     )
     summary_agent = Agent(name="GameSummarizer", instructions=summary_instructions)
 
     return analysis_agent, summary_agent
 
+
+def build_analysis_prompt() -> str:
+    """Return the base analysis prompt for frame evaluation."""
+    return (
+        "IMPORTANT: Analyze ONLY the RetroArch game window. Ignore any code editors, desktop elements, or other applications. "
+        "Focus exclusively on the game content displayed in RetroArch.\n"
+        "Before calling tools, emit a brief tool preamble (internal only) that restates the battle goal and lists the Pokémon you will query via fetch_pokemon_profile. "
+        "Call fetch_pokemon_profile proactively (budget 10 per frame) for each clearly identified Pokémon in the battle. No other tools are available. "
+        "Do not include any preamble or tool outputs in your final message.\n\n"
+        "Respond with ONLY a JSON object (no markdown, no extra text). The JSON must have these fields:\n"
+        "- game_name: string (e.g., 'Pokemon Black', 'Pokemon HeartGold')\n"
+        "- scene: string (brief description: 'battle', 'overworld', 'menu', etc.)\n"
+        "- characters: array of objects with {name: string, level: int, hp_current: int, hp_max: int, status: string}\n"
+        "- environment: string (brief description of the environment/setting)\n"
+        "- notable_events: string (any significant action happening, or 'none')\n"
+        "Example: {\"game_name\": \"Pokemon Black\", \"scene\": \"battle\", \"characters\": [{\"name\": \"Tepig\", \"level\": 6, \"hp_current\": 21, \"hp_max\": 25, \"status\": \"normal\"}], \"environment\": \"grassy field\", \"notable_events\": \"Player's turn to select action\"}"
+    )
+
+
+def _emit(handlers: Iterable[Callable[[dict[str, Any]], None]], payload: dict[str, Any]) -> None:
+    for handler in handlers:
+        try:
+            handler(payload)
+        except Exception as exc:  # pragma: no cover
+            print(f"Callback error: {exc}", file=sys.stderr)
+
+
+def _relative_image_path(path: Path) -> str:
+    try:
+        rel = path.relative_to(Path(__file__).resolve().parent)
+        return str(rel).replace(os.sep, "/")
+    except ValueError:
+        return str(path)
+
+
+def _default_analysis_handler(payload: dict[str, Any]) -> None:
+    if payload.get("type") != "analysis":
+        return
+
+    timestamp = payload.get("timestamp", "")
+    data = payload.get("data") or {}
+    print(f"[{timestamp}] Frame Analysis:\n{json.dumps(data, indent=2)}\n")
+
+    meta = payload.get("meta") or {}
+    battle_detected = str(meta.get("battle_detected", False)).lower()
+    participants = meta.get("participants") or []
+    participants_str = " vs. ".join(participants) if participants else "none"
+    tool_state = "called successfully" if meta.get("tool_called") else "not called"
+    stats_integrated = str(meta.get("stats_integrated", False)).lower()
+
+    print("=== Agent Battle Flow Log ===")
+    print(f"Battle detected -> {battle_detected}")
+    print(f"Participants identified -> {participants_str}")
+    print(f"pokeapi_tool (pokemon endpoint) -> {tool_state}")
+    print(f"Stats integrated -> {stats_integrated}")
+    print("=== Verification ===")
+    print("Tool usage restricted to Pokémon endpoint -> confirmed\n")
+
+    capture_index = payload.get("capture_index")
+    if capture_index is not None:
+        print(f"DEBUG: Capture count: {capture_index}\n")
+
+
+def _default_summary_handler(payload: dict[str, Any]) -> None:
+    if payload.get("type") != "summary":
+        return
+
+    window = payload.get("window", 20)
+    capture_total = payload.get("capture_total", window)
+    timestamp = payload.get("timestamp", "")
+    summary = payload.get("summary", "")
+
+    print("=" * 60)
+    print(f"GENERATING SUMMARY OF LAST {window} FRAMES (Total captures: {capture_total})...")
+    print("=" * 60)
+    print(f"[{timestamp}] Summary:\n{summary}\n")
+    print("=" * 60 + "\n")
+
+
+def _default_error_handler(payload: dict[str, Any]) -> None:
+    message = payload.get("message", "Analysis error")
+    timestamp = payload.get("timestamp")
+    prefix = f"[{timestamp}] " if timestamp else ""
+    print(f"{prefix}{message}")
+
+    raw = payload.get("raw")
+    if raw:
+        print(f"{raw}\n")
+
+
+class BroadcastChannel:
+    """Lightweight pub/sub channel backed by per-subscriber queues."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._subscribers: list[queue.Queue[Dict[str, Any]]] = []
+
+    def subscribe(self) -> queue.Queue[Dict[str, Any]]:
+        subscriber: queue.Queue[Dict[str, Any]] = queue.Queue()
+        with self._lock:
+            self._subscribers.append(subscriber)
+        return subscriber
+
+    def unsubscribe(self, subscriber: queue.Queue[Dict[str, Any]]) -> None:
+        with self._lock:
+            if subscriber in self._subscribers:
+                self._subscribers.remove(subscriber)
+
+    def publish(self, payload: Dict[str, Any]) -> None:
+        with self._lock:
+            subscribers = list(self._subscribers)
+        for subscriber in subscribers:
+            subscriber.put(payload)
+
+
+analysis_channel = BroadcastChannel()
+summary_channel = BroadcastChannel()
+_capture_thread: threading.Thread | None = None
+_capture_lock = threading.Lock()
+
+
+def _event_response(channel: BroadcastChannel) -> Response:
+    def generator() -> Any:
+        q = channel.subscribe()
+        try:
+            while True:
+                try:
+                    payload = q.get(timeout=10)
+                except queue.Empty:
+                    yield ": keep-alive\n\n"
+                    continue
+                yield f"data: {json.dumps(payload)}\n\n"
+        finally:
+            channel.unsubscribe(q)
+
+    response = Response(stream_with_context(generator()), mimetype="text/event-stream")
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
 
 def extract_final_output(run_result) -> str:
     """Extract final string output from an Agents SDK run result."""
@@ -197,8 +381,9 @@ def analyze_image(agent: Agent, image_path: Path, prompt: str) -> str:
 
 
 def generate_summary(agent: Agent, analyses: list[dict]) -> str:
-    """Generate a summary of the last 3 game analyses."""
-    summary_text = "Here are the last 3 gameplay analyses:\n\n"
+    """Generate a summary of the provided game analyses."""
+    count = len(analyses)
+    summary_text = f"Here are the last {count} gameplay analyses:\n\n"
     for i, analysis in enumerate(analyses, 1):
         summary_text += f"Frame {i}:\n{json.dumps(analysis, indent=2)}\n\n"
     
@@ -215,37 +400,34 @@ def generate_summary(agent: Agent, analyses: list[dict]) -> str:
     return extract_final_output(run)
 
 
-def main():
-    cfg = load_config()
-    ensure_out_dir(cfg["out_dir"])
+def run_capture_loop(
+    cfg: dict[str, Any],
+    analysis_agent: Agent,
+    summary_agent: Agent,
+    prompt: str,
+    *,
+    analysis_handlers: Optional[Iterable[Callable[[dict[str, Any]], None]]] = None,
+    summary_handlers: Optional[Iterable[Callable[[dict[str, Any]], None]]] = None,
+    error_handlers: Optional[Iterable[Callable[[dict[str, Any]], None]]] = None,
+    stop_event: Optional[Any] = None,
+) -> None:
+    """Run the continuous capture loop, emitting payloads via the provided handlers."""
 
-    analysis_agent, summary_agent = build_agents(cfg["model"])
-    # Analysis prompt tuned for maximal eagerness + preambles while preserving JSON-only final output.
-    prompt = (
-        "IMPORTANT: Analyze ONLY the RetroArch game window. Ignore any code editors, desktop elements, or other applications. "
-        "Focus exclusively on the game content displayed in RetroArch.\n"
-        "Before calling tools, emit a brief tool preamble (internal only): restate the goal and outline which tools you'll call. "
-        "Then, CALL tools proactively up to 10 total calls per frame: fetch_pokemon_core for each visible Pokémon (and optionally fetch_pokemon_stats to cross-check), fetch_move_details for each visible move, fetch_type_relations for involved types, and fetch_ability_details when shown or implied. "
-        "Do not include any preamble or tool outputs in your final message.\n\n"
-        "Respond with ONLY a JSON object (no markdown, no extra text). The JSON must have these fields:\n"
-        "- game_name: string (e.g., 'Pokemon Black', 'Pokemon HeartGold')\n"
-        "- scene: string (brief description: 'battle', 'overworld', 'menu', etc.)\n"
-        "- characters: array of objects with {name: string, level: int, hp_current: int, hp_max: int, status: string}\n"
-        "- environment: string (brief description of the environment/setting)\n"
-        "- notable_events: string (any significant action happening, or 'none')\n"
-        "Example: {\"game_name\": \"Pokemon Black\", \"scene\": \"battle\", \"characters\": [{\"name\": \"Tepig\", \"level\": 6, \"hp_current\": 21, \"hp_max\": 25, \"status\": \"normal\"}], \"environment\": \"grassy field\", \"notable_events\": \"Player's turn to select action\"}"
-    )
+    handlers_analysis = list(analysis_handlers) if analysis_handlers else [_default_analysis_handler]
+    handlers_summary = list(summary_handlers) if summary_handlers else [_default_summary_handler]
+    handlers_error = list(error_handlers) if error_handlers else [_default_error_handler]
 
-    print(f"Capturing from app: {cfg['app_name']} every {cfg['interval']}s using model {cfg['model']}")
-    print(f"Saving screenshots to: {cfg['out_dir']}")
-    print("Generating summary after every 3 captures\n")
-
-    recent_analyses = []
-    # Cache fetched stats to avoid repeated API calls and follow PokeAPI fair use.
-    stats_cache: dict[str, dict] = {}
+    recent_analyses: list[dict[str, Any]] = []
     capture_count = 0
 
     while True:
+        if stop_event is not None and hasattr(stop_event, "is_set"):
+            try:
+                if stop_event.is_set():
+                    break
+            except Exception:  # pragma: no cover
+                pass
+
         now = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = cfg["out_dir"] / f"retroarch_{now}.png"
 
@@ -255,88 +437,289 @@ def main():
 
         ok = screencapture_png(out_path, bounds)
         if not ok:
-            print("Screenshot failed; retrying after interval…")
+            _emit(
+                handlers_error,
+                {
+                    "type": "analysis_error",
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "message": "Screenshot failed; retrying after interval...",
+                    "image_path": _relative_image_path(out_path),
+                },
+            )
             time.sleep(cfg["interval"])
             continue
 
         try:
             content = analyze_image(analysis_agent, out_path, prompt)
-            # Try to parse as JSON
-            data = None
-            parsed_successfully = False
-            
-            try:
-                data = json.loads(content)
-                parsed_successfully = True
-            except json.JSONDecodeError:
-                # If not valid JSON, try to extract JSON from markdown code blocks
-                content_stripped = content.strip()
-                if content_stripped.startswith("```"):
-                    lines = content_stripped.split("\n")
-                    json_lines = []
-                    in_json = False
-                    for line in lines:
-                        if line.startswith("```"):
-                            if in_json:
-                                break
-                            in_json = True
-                            continue
-                        if in_json:
-                            json_lines.append(line)
-                    try:
-                        data = json.loads("\n".join(json_lines))
-                        parsed_successfully = True
-                    except json.JSONDecodeError:
-                        pass
-            
-            # Display result
-            timestamp = datetime.now().isoformat(timespec='seconds')
-            if parsed_successfully and data:
-                print(f"[{timestamp}] Frame Analysis:\n{json.dumps(data, indent=2)}\n")
-
-                # Fetch PokeAPI stats for any newly discovered Pokémon names (once per name).
-                try:
-                    from pokeapi_tool import fetch_pokemon_stats_sync
-
-                    discovered = []
-                    for ch in (data.get("characters") or []):
-                        name = str(ch.get("name", "")).strip()
-                        if name and name not in stats_cache:
-                            discovered.append(name)
-                    if discovered:
-                        stats_result = fetch_pokemon_stats_sync(discovered)
-                        for nm, st in stats_result.items():
-                            stats_cache[nm] = st
-                        print("PokeAPI stats fetched:")
-                        print(json.dumps({k: stats_cache[k] for k in discovered}, indent=2))
-                        print()
-                except Exception as exc:
-                    print(f"PokeAPI stats fetch error: {exc}")
-                
-                # Track successful analyses
-                recent_analyses.append(data)
-                capture_count += 1
-                print(f"DEBUG: Capture count: {capture_count}")
-                
-                # Generate summary every 10 captures
-                if capture_count % 10 == 0:
-                    print("=" * 60)
-                    print(f"GENERATING SUMMARY OF LAST 10 FRAMES (Total captures: {capture_count})...")
-                    print("=" * 60)
-                    try:
-                        summary = generate_summary(summary_agent, recent_analyses[-10:])
-                        summary_timestamp = datetime.now().isoformat(timespec='seconds')
-                        print(f"[{summary_timestamp}] Summary:\n{summary}\n")
-                        print("=" * 60 + "\n")
-                    except Exception as exc:
-                        print(f"Summary generation error: {exc}\n")
-            else:
-                print(f"[{timestamp}] Failed to parse JSON. Raw response:\n{content}\n")
-                
         except Exception as exc:
-            print(f"Analysis error: {exc}")
+            _emit(
+                handlers_error,
+                {
+                    "type": "analysis_error",
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "message": f"Analysis error: {exc}",
+                    "image_path": _relative_image_path(out_path),
+                },
+            )
+            time.sleep(cfg["interval"])
+            continue
+
+        data: dict[str, Any] | None = None
+        parsed_successfully = False
+
+        try:
+            data = json.loads(content)
+            parsed_successfully = True
+        except json.JSONDecodeError:
+            content_stripped = content.strip()
+            if content_stripped.startswith("```"):
+                lines = content_stripped.split("\n")
+                json_lines: list[str] = []
+                in_json = False
+                for line in lines:
+                    if line.startswith("```"):
+                        if in_json:
+                            break
+                        in_json = True
+                        continue
+                    if in_json:
+                        json_lines.append(line)
+                try:
+                    data = json.loads("\n".join(json_lines))
+                    parsed_successfully = True
+                except json.JSONDecodeError:
+                    parsed_successfully = False
+
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        image_relative = _relative_image_path(out_path)
+
+        if parsed_successfully and data is not None:
+            latest_calls = pull_latest_pokemon_calls()
+            scene_text = str(data.get("scene", "")).lower()
+            battle_detected = "battle" in scene_text
+            participants = [
+                str((ch or {}).get("name", "")).strip()
+                for ch in (data.get("characters") or [])
+                if str((ch or {}).get("name", "")).strip()
+            ]
+            call_names = {
+                str(name).lower()
+                for entry in latest_calls
+                for name in entry.get("names", [])
+            }
+            tool_called = bool(latest_calls)
+            stats_integrated = (
+                battle_detected
+                and bool(participants)
+                and all(name.lower() in call_names for name in participants)
+            )
+
+            recent_analyses.append(data)
+            capture_count += 1
+
+            analysis_payload = {
+                "type": "analysis",
+                "timestamp": timestamp,
+                "image_path": image_relative,
+                "data": data,
+                "raw": content,
+                "capture_index": capture_count,
+                "meta": {
+                    "battle_detected": battle_detected,
+                    "participants": participants,
+                    "tool_called": tool_called,
+                    "stats_integrated": stats_integrated,
+                    "latest_calls": latest_calls,
+                },
+            }
+            _emit(handlers_analysis, analysis_payload)
+
+            if capture_count % 20 == 0:
+                try:
+                    summary = generate_summary(summary_agent, recent_analyses[-20:])
+                    summary_timestamp = datetime.now().isoformat(timespec="seconds")
+                    summary_payload = {
+                        "type": "summary",
+                        "timestamp": summary_timestamp,
+                        "summary": summary,
+                        "capture_total": capture_count,
+                        "window": min(len(recent_analyses), 20),
+                    }
+                    _emit(handlers_summary, summary_payload)
+                except Exception as exc:
+                    _emit(
+                        handlers_error,
+                        {
+                            "type": "analysis_error",
+                            "timestamp": datetime.now().isoformat(timespec="seconds"),
+                            "message": f"Summary generation error: {exc}",
+                        },
+                    )
+        else:
+            _emit(
+                handlers_error,
+                {
+                    "type": "analysis_error",
+                    "timestamp": timestamp,
+                    "message": "Failed to parse JSON. Raw response:",
+                    "raw": content,
+                    "image_path": image_relative,
+                },
+            )
 
         time.sleep(cfg["interval"])
+
+def start_capture_thread(
+    cfg: dict[str, Any],
+    analysis_agent: Agent,
+    summary_agent: Agent,
+    prompt: str,
+) -> None:
+    """Ensure the capture loop runs in a daemon thread for streaming."""
+
+    global _capture_thread
+
+    ensure_out_dir(cfg["out_dir"], clear=False)
+
+    with _capture_lock:
+        if _capture_thread and _capture_thread.is_alive():
+            return
+
+        def handle_analysis(payload: Dict[str, Any]) -> None:
+            analysis_channel.publish(payload)
+
+        def handle_summary(payload: Dict[str, Any]) -> None:
+            summary_channel.publish(payload)
+
+        def handle_error(payload: Dict[str, Any]) -> None:
+            analysis_channel.publish(payload)
+
+        def loop() -> None:
+            # Set up event loop for this thread so async operations work
+            asyncio.set_event_loop(asyncio.new_event_loop())
+            run_capture_loop(
+                cfg,
+                analysis_agent,
+                summary_agent,
+                prompt,
+                analysis_handlers=[handle_analysis],
+                summary_handlers=[handle_summary],
+                error_handlers=[handle_error],
+            )
+
+        _capture_thread = threading.Thread(target=loop, name="capture-loop", daemon=True)
+        _capture_thread.start()
+
+
+def _create_web_app(
+    cfg: dict[str, Any],
+    analysis_agent: Agent,
+    summary_agent: Agent,
+    prompt: str,
+) -> Flask:
+    app = Flask(__name__)
+
+    def ensure_thread() -> None:
+        start_capture_thread(cfg, analysis_agent, summary_agent, prompt)
+
+    @app.route("/")
+    def index() -> str:
+        ensure_thread()
+        return render_template("index.html")
+
+    @app.route("/stream/analysis")
+    def stream_analysis() -> Response:
+        ensure_thread()
+        return _event_response(analysis_channel)
+
+    @app.route("/stream/summaries")
+    def stream_summaries() -> Response:
+        ensure_thread()
+        return _event_response(summary_channel)
+
+    return app
+
+
+def serve_web_app(
+    cfg: Optional[dict[str, Any]] = None,
+    analysis_agent: Optional[Agent] = None,
+    summary_agent: Optional[Agent] = None,
+    prompt: Optional[str] = None,
+) -> None:
+    """Launch the streaming web UI alongside the capture loop."""
+
+    cfg = cfg or load_config()
+    if analysis_agent is None or summary_agent is None:
+        analysis_agent, summary_agent = build_agents(cfg["model"])
+    if prompt is None:
+        prompt = build_analysis_prompt()
+
+    ensure_out_dir(cfg["out_dir"], clear=True)
+
+    host = cfg["ui_host"]
+    port = cfg["ui_port"]
+
+    app = _create_web_app(cfg, analysis_agent, summary_agent, prompt)
+
+    start_capture_thread(cfg, analysis_agent, summary_agent, prompt)
+
+    print(f"Streaming UI available at http://{host}:{port}")
+    app.run(host=host, port=port, debug=False)
+
+
+def create_app() -> Flask:
+    """Flask factory for `flask run`. Ensures capture loop starts once."""
+
+    cfg = load_config()
+    ensure_out_dir(cfg["out_dir"], clear=True)
+    analysis_agent, summary_agent = build_agents(cfg["model"])
+    prompt = build_analysis_prompt()
+
+    os.environ.setdefault("FLASK_RUN_HOST", cfg["ui_host"])
+    os.environ.setdefault("FLASK_RUN_PORT", str(cfg["ui_port"]))
+
+    start_capture_thread(cfg, analysis_agent, summary_agent, prompt)
+    return _create_web_app(cfg, analysis_agent, summary_agent, prompt)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="RetroArch capture loop and streaming UI")
+    parser.add_argument(
+        "--web",
+        action="store_true",
+        help="Run the streaming web UI instead of the CLI logger",
+    )
+    parser.add_argument(
+        "--ui-host",
+        help="Override STREAM_UI_HOST when running the web UI",
+    )
+    parser.add_argument(
+        "--ui-port",
+        type=int,
+        help="Override STREAM_UI_PORT when running the web UI",
+    )
+    args = parser.parse_args()
+
+    cfg = load_config()
+    if args.ui_host:
+        cfg["ui_host"] = args.ui_host
+    if args.ui_port is not None:
+        cfg["ui_port"] = args.ui_port
+
+    analysis_agent, summary_agent = build_agents(cfg["model"])
+    prompt = build_analysis_prompt()
+
+    if args.web:
+        serve_web_app(cfg, analysis_agent, summary_agent, prompt)
+        return
+
+    ensure_out_dir(cfg["out_dir"], clear=True)
+
+    print(f"Capturing from app: {cfg['app_name']} every {cfg['interval']}s using model {cfg['model']}")
+    print(f"Saving screenshots to: {cfg['out_dir']}")
+    print("Generating summary after every 20 captures\n")
+
+    run_capture_loop(cfg, analysis_agent, summary_agent, prompt)
 
 
 if __name__ == "__main__":
