@@ -16,6 +16,7 @@ A Python tool that captures screenshots from RetroArch gameplay and uses OpenAI'
 - Python 3.11+
 - macOS (uses `screencapture` and AppleScript)
 - OpenAI API key (or compatible API)
+- macOS Accessibility permissions for Terminal/IDE (for window detection)
 
 ## Installation
 
@@ -33,7 +34,13 @@ cp env.example .env
 # Edit .env and add your OPENAI_API_KEY
 ```
 
-3. **Run:**
+3. **Test window detection (optional but recommended):**
+```bash
+python test_window_detection.py
+```
+This will verify that RetroArch can be detected and show you a list of all available windows if detection fails.
+
+4. **Run:**
 ```bash
 python retroarch_capture.py
 ```
@@ -104,13 +111,15 @@ SCREENSHOT_INTERVAL_SECONDS=10
 2. **Screenshot Capture**: Captures the RetroArch window using macOS `screencapture`
 3. **AI Analysis**: Sends screenshot to OpenAI Vision API with structured prompt
 4. **JSON Parsing**: Extracts game state data (characters, HP, scene, etc.)
-5. **Summary Generation**: Every 3 captures, generates a gameplay summary
+5. **Summary Generation**: Every 20 captures, generates a gameplay summary
 
 ## Troubleshooting
 
 **"RetroArch window not found"**
 - Make sure RetroArch is running and visible
-- Check that `CAPTURE_SOURCE` matches your window title
+- Run `python test_window_detection.py` to see all available windows
+- Set `CAPTURE_SOURCE` in your `.env` to match the exact process name
+- The tool falls back to full-screen capture if window detection fails
 
 **JSON parsing errors**
 - The tool attempts to extract JSON from markdown code blocks
@@ -120,6 +129,12 @@ SCREENSHOT_INTERVAL_SECONDS=10
 - Verify your `OPENAI_API_KEY` is correct
 - Check `OPENAI_BASE_URL` if using non-OpenAI APIs
 - Ensure your API has vision/image capabilities
+
+**Permission issues (macOS)**
+- If window detection doesn't work, you may need to grant accessibility permissions
+- Go to: System Preferences > Security & Privacy > Privacy > Accessibility
+- Add Terminal (or your IDE) to the allowed apps list
+- You may need to restart your terminal/IDE after granting permissions
 
 ## File Structure
 

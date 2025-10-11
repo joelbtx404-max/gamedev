@@ -11,6 +11,36 @@ body {
   min-height: 100vh;
 }
 
+.floating-action {
+  position: fixed;
+  top: 1.25rem;
+  right: 1.25rem;
+  z-index: 1000;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 3.5rem;
+  height: 3.5rem;
+  padding: 0.4rem;
+  border: 1px solid rgba(97, 120, 186, 0.55);
+  border-radius: 999px;
+  background: rgba(18, 21, 33, 0.92);
+  box-shadow: 0 14px 32px rgba(6, 8, 16, 0.45);
+  cursor: pointer;
+  backdrop-filter: blur(14px);
+}
+
+.floating-action img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.floating-action:focus-visible {
+  outline: 2px solid rgba(135, 88, 255, 0.8);
+  outline-offset: 3px;
+}
+
 main {
   max-width: 1000px;
   margin: 0 auto;

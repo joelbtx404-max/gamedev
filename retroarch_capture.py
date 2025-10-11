@@ -35,6 +35,17 @@ def load_config():
     else:
         ui_port = 5050
 
+    summary_interval_env = os.getenv("SUMMARY_INTERVAL") or os.getenv("SUMMARY_EVERY")
+    if summary_interval_env:
+        try:
+            summary_interval = int(summary_interval_env)
+        except ValueError as exc:  # pragma: no cover - configuration error
+            raise RuntimeError("SUMMARY_INTERVAL must be an integer") from exc
+        if summary_interval <= 0:
+            raise RuntimeError("SUMMARY_INTERVAL must be >= 1")
+    else:
+        summary_interval = 5
+
     cfg = {
         "interval": float(os.getenv("SCREENSHOT_INTERVAL_SECONDS", "2")),
         "app_name": os.getenv("CAPTURE_SOURCE", "RetroArch"),
@@ -44,6 +55,7 @@ def load_config():
         "out_dir": Path(os.getenv("SCREENSHOTS_DIR", str(Path(__file__).resolve().parent / "static" / "images"))).resolve(),
         "ui_host": os.getenv("STREAM_UI_HOST", "0.0.0.0"),
         "ui_port": ui_port,
+        "summary_interval": summary_interval,
     }
     missing = [k for k in ("api_key",) if not cfg[k]]
     if missing:
@@ -64,6 +76,45 @@ def ensure_out_dir(path: Path, clear: bool = False) -> None:
                 shutil.rmtree(item)
         except Exception as exc:  # pragma: no cover
             print(f"Failed to remove stale capture '{item}': {exc}")
+
+
+def list_all_windows() -> list[tuple[str, str]]:
+    """
+    Return a list of (process_name, window_name) for all visible windows.
+    Useful for debugging window detection issues.
+    """
+    script = '''
+    tell application "System Events"
+        set windowList to {}
+        repeat with proc in (every process whose visible is true)
+            set procName to name of proc
+            try
+                repeat with win in (windows of proc)
+                    set winName to name of win
+                    set end of windowList to procName & " | " & winName
+                end repeat
+            end try
+        end repeat
+        return windowList
+    end tell
+    '''
+    try:
+        result = subprocess.run([
+            "osascript", "-e", script
+        ], capture_output=True, text=True, check=True)
+        out = result.stdout.strip()
+        if not out:
+            return []
+        # Parse the list format from AppleScript
+        items = out.split(", ")
+        windows = []
+        for item in items:
+            if " | " in item:
+                parts = item.split(" | ", 1)
+                windows.append((parts[0].strip(), parts[1].strip()))
+        return windows
+    except Exception:
+        return []
 
 
 def osascript_get_bounds(app_name: str) -> tuple[int, int, int, int] | None:
@@ -275,13 +326,23 @@ def _default_summary_handler(payload: dict[str, Any]) -> None:
     if payload.get("type") != "summary":
         return
 
-    window = payload.get("window", 20)
-    capture_total = payload.get("capture_total", window)
+    interval = payload.get("interval")
+    window = payload.get("window")
+    new_frames = payload.get("delta", window)
+    capture_total = payload.get("capture_total", window or 0)
     timestamp = payload.get("timestamp", "")
     summary = payload.get("summary", "")
 
     print("=" * 60)
-    print(f"GENERATING SUMMARY OF LAST {window} FRAMES (Total captures: {capture_total})...")
+    headline = "UPDATED CUMULATIVE SUMMARY"
+    if interval:
+        headline += f" (every {interval} captures)"
+    details: list[str] = []
+    if new_frames:
+        details.append(f"new frames: {new_frames}")
+    details.append(f"total captures: {capture_total}")
+    detail_str = " | ".join(details)
+    print(f"{headline} | {detail_str}")
     print("=" * 60)
     print(f"[{timestamp}] Summary:\n{summary}\n")
     print("=" * 60 + "\n")
@@ -380,24 +441,40 @@ def analyze_image(agent: Agent, image_path: Path, prompt: str) -> str:
     return extract_final_output(run)
 
 
-def generate_summary(agent: Agent, analyses: list[dict]) -> str:
-    """Generate a summary of the provided game analyses."""
-    count = len(analyses)
-    summary_text = f"Here are the last {count} gameplay analyses:\n\n"
+def generate_summary(agent: Agent, analyses: list[dict], previous_summary: str = "") -> str:
+    """Generate or update a cumulative summary based on new analyses."""
+
+    latest_count = len(analyses)
+    prompt_parts: list[str] = [
+        "You are maintaining a cumulative summary of an ongoing Pokémon gameplay session.",
+        "Incorporate the new frame analyses into the running summary while preserving important context from earlier notes.",
+    ]
+
+    if previous_summary:
+        prompt_parts.append("Current cumulative summary:\n" + previous_summary)
+    else:
+        prompt_parts.append("Current cumulative summary: (none yet – begin one now.)")
+
+    prompt_parts.append(f"New frame analyses to integrate ({latest_count}):")
     for i, analysis in enumerate(analyses, 1):
-        summary_text += f"Frame {i}:\n{json.dumps(analysis, indent=2)}\n\n"
-    
-    summary_text += (
-        "Provide a brief summary of the gameplay progression. "
-        "Focus on: what happened, any progress made, battles/encounters, level ups, location changes. "
-        "Keep it concise (2-3 sentences)."
+        prompt_parts.append(f"Frame +{i}:\n{json.dumps(analysis, indent=2)}")
+
+    prompt_parts.append(
+        "Respond with the refreshed cumulative summary (3-4 sentences). "
+        "Highlight major events, progress, battles, party updates, and notable location changes without repeating irrelevant details."
     )
-    
+
+    summary_text = "\n\n".join(prompt_parts)
+
+    if latest_count == 0:
+        return previous_summary
+
     run = Runner.run_sync(
         agent,
         input=summary_text,
     )
-    return extract_final_output(run)
+    output = extract_final_output(run).strip()
+    return output or previous_summary
 
 
 def run_capture_loop(
@@ -417,8 +494,14 @@ def run_capture_loop(
     handlers_summary = list(summary_handlers) if summary_handlers else [_default_summary_handler]
     handlers_error = list(error_handlers) if error_handlers else [_default_error_handler]
 
+    summary_interval = int(cfg.get("summary_interval", 5) or 5)
+    if summary_interval <= 0:
+        summary_interval = 5
+
     recent_analyses: list[dict[str, Any]] = []
     capture_count = 0
+    cumulative_summary = ""
+    last_summary_len = 0
 
     while True:
         if stop_event is not None and hasattr(stop_event, "is_set"):
@@ -433,7 +516,13 @@ def run_capture_loop(
 
         bounds = osascript_get_bounds(cfg["app_name"])  # None -> full screen
         if bounds is None:
-            print("RetroArch window not found; capturing full screen.")
+            if capture_count == 0:
+                print(f"WARNING: '{cfg['app_name']}' window not found, falling back to full screen capture.")
+                print(f"Run 'python test_window_detection.py' to troubleshoot.\n")
+        else:
+            if capture_count == 0:
+                x, y, w, h = bounds
+                print(f"✓ Detected '{cfg['app_name']}' window: {w}x{h} at ({x}, {y})\n")
 
         ok = screencapture_png(out_path, bounds)
         if not ok:
@@ -534,27 +623,34 @@ def run_capture_loop(
             }
             _emit(handlers_analysis, analysis_payload)
 
-            if capture_count % 20 == 0:
-                try:
-                    summary = generate_summary(summary_agent, recent_analyses[-20:])
-                    summary_timestamp = datetime.now().isoformat(timespec="seconds")
-                    summary_payload = {
-                        "type": "summary",
-                        "timestamp": summary_timestamp,
-                        "summary": summary,
-                        "capture_total": capture_count,
-                        "window": min(len(recent_analyses), 20),
-                    }
-                    _emit(handlers_summary, summary_payload)
-                except Exception as exc:
-                    _emit(
-                        handlers_error,
-                        {
-                            "type": "analysis_error",
-                            "timestamp": datetime.now().isoformat(timespec="seconds"),
-                            "message": f"Summary generation error: {exc}",
-                        },
-                    )
+            if capture_count % summary_interval == 0:
+                new_entries = recent_analyses[last_summary_len:]
+                if new_entries:
+                    try:
+                        summary = generate_summary(summary_agent, new_entries, cumulative_summary)
+                        cumulative_summary = summary
+                        last_summary_len = len(recent_analyses)
+                        summary_timestamp = datetime.now().isoformat(timespec="seconds")
+                        summary_payload = {
+                            "type": "summary",
+                            "timestamp": summary_timestamp,
+                            "summary": cumulative_summary,
+                            "capture_total": capture_count,
+                            "window": len(new_entries),
+                            "delta": len(new_entries),
+                            "interval": summary_interval,
+                            "cumulative": True,
+                        }
+                        _emit(handlers_summary, summary_payload)
+                    except Exception as exc:
+                        _emit(
+                            handlers_error,
+                            {
+                                "type": "analysis_error",
+                                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                                "message": f"Summary generation error: {exc}",
+                            },
+                        )
         else:
             _emit(
                 handlers_error,
@@ -717,7 +813,7 @@ def main() -> None:
 
     print(f"Capturing from app: {cfg['app_name']} every {cfg['interval']}s using model {cfg['model']}")
     print(f"Saving screenshots to: {cfg['out_dir']}")
-    print("Generating summary after every 20 captures\n")
+    print(f"Generating cumulative summary every {cfg['summary_interval']} captures\n")
 
     run_capture_loop(cfg, analysis_agent, summary_agent, prompt)
 
