@@ -7,6 +7,7 @@ from agents import function_tool
 
 _POKEAPI_BASE = os.getenv("POKEAPI_BASE_URL", "https://pokeapi.co/api/v2")
 _pokemon_cache: Dict[str, Dict[str, Any]] = {}
+_type_weakness_cache: Dict[str, List[str]] = {}
 _latest_pokemon_calls: List[Dict[str, Any]] = []
 
 
@@ -32,6 +33,41 @@ def _record_call(names: List[str], payload: Dict[str, Any]) -> None:
         "names": names,
         "data": payload,
     })
+
+
+def _fetch_type_weaknesses(type_name: str) -> List[str]:
+    key = _normalise_name(type_name)
+    if not key:
+        return []
+
+    if key in _type_weakness_cache:
+        return _type_weakness_cache[key]
+
+    url = f"{_POKEAPI_BASE}/type/{key}/"
+    data, err = _get_json(url)
+    if err or not data:
+        weaknesses: List[str] = []
+    else:
+        relations = data.get("damage_relations") or {}
+        double_from = relations.get("double_damage_from") or []
+        weaknesses = [
+            _normalise_name((entry or {}).get("name"))
+            for entry in double_from
+            if isinstance((entry or {}).get("name"), str)
+        ]
+        weaknesses = [name for name in dict.fromkeys(weaknesses) if name]
+
+    _type_weakness_cache[key] = weaknesses
+    return weaknesses
+
+
+def _collect_weaknesses(type_names: List[str]) -> List[str]:
+    weaknesses: List[str] = []
+    for type_name in type_names:
+        weaknesses.extend(_fetch_type_weaknesses(type_name))
+
+    ordered_unique = [name for name in dict.fromkeys(weaknesses) if name]
+    return ordered_unique
 
 
 def pull_latest_pokemon_calls() -> List[Dict[str, Any]]:
@@ -79,6 +115,9 @@ def fetch_pokemon_profile(pokemon_name: str) -> str:
             for s in data.get("stats", []) or []
             if isinstance(s.get("base_stat"), int)
         }
+        height = data.get("height")
+        weight = data.get("weight")
+        weaknesses = _collect_weaknesses(types)
         moves = []
         for m in data.get("moves", []) or []:
             mv = m.get("move") or {}
@@ -96,6 +135,9 @@ def fetch_pokemon_profile(pokemon_name: str) -> str:
             "base_stats": stats,
             "moves": limited_moves,
             "moves_truncated": len(dedup_moves) > len(limited_moves),
+            "height": height,
+            "weight": weight,
+            "weaknesses": weaknesses,
         }
     except Exception as exc:
         result = {"error": f"extract_error: {exc}"}
