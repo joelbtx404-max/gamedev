@@ -1,0 +1,25 @@
+Goal:
+- Resolve the `RuntimeError: There is no current event loop in thread` raised by the chat feature when the `/api/chat` endpoint is invoked.
+- Decouple the chat workflow so it runs reliably whether or not the game capture loop is active, enabling the chat UI to operate independently.
+
+Constraints:
+- Keep the capture loop threading model in `retroarch_capture.py` intact; do not block or slow the streaming SSE endpoints.
+- Avoid introducing new async event loops inside Flask request handlers; prefer thread-safe synchronous helpers or a dedicated background worker.
+- Preserve existing public routes `/api/chat`, `/stream/analysis`, and `/stream/summaries` and their payload shapes.
+- Follow the project’s Python style guide (PEP 8, logging over print) and avoid adding new external dependencies.
+
+Tools:
+- `python` for manual verification, e.g. `python chat_app.py` and `python retroarch_capture.py --web`.
+- Existing helper functions `build_chat_agent` and `process_chat_message` defined in `retroarch_capture.py`.
+- Optional local debugging via environment variable `POKEAPI_TOOL_DEBUG=1`.
+
+Context:
+- The web app is created in `retroarch_capture.py::_create_web_app`; the chat endpoint currently attempts to hop across event loops when called from the streaming server.
+- A standalone Flask wrapper lives in `chat_app.py` and should also benefit from the fix.
+- The capture thread bootstrap happens inside `start_capture_thread`, which sets up its own asyncio loop for streaming; ensure the chat handler does not depend on that loop.
+- The reported error surfaces when `process_chat_message` is invoked from a request thread that lacks an event loop.
+
+Deliverables:
+- Refactored chat handling code (likely in `retroarch_capture.py` and, if necessary, `chat_app.py`) that eliminates the event loop runtime error and keeps chat fully functional without the capture service.
+- Any supporting utility abstractions or tests added to demonstrate the chat feature working independently.
+- Brief verification notes on how to exercise the chat endpoint after the change.

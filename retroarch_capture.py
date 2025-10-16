@@ -32,6 +32,9 @@ except Exception as exc:  # pragma: no cover
     print("openai-agents is required. pip install openai-agents", file=sys.stderr)
     raise
 
+# Ensure environment variables from .env are available whenever this module is imported.
+load_dotenv()
+
 
 def load_config():
     load_dotenv()
@@ -306,10 +309,25 @@ def build_chat_agent(model_name: str) -> Agent:
 
 def process_chat_message(agent: Agent, message: str) -> str:
     """Process a chat message using the PokéAPI agent."""
-    run = Runner.run_sync(
-        agent,
-        input=message,
-    )
+    def _run_sync() -> Any:
+        return Runner.run_sync(
+            agent,
+            input=message,
+        )
+
+    try:
+        run = _run_sync()
+    except RuntimeError as exc:
+        error_text = str(exc).lower()
+        if "no current event loop" not in error_text and "event loop is closed" not in error_text:
+            raise
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            run = _run_sync()
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
     return extract_final_output(run)
 
 
@@ -800,25 +818,7 @@ def _create_web_app(
             message = data.get("message", "")
             if not message:
                 return jsonify({"error": "No message provided"}), 400
-            
-            # Use the chat agent to process the message
-            import asyncio
-            
-            try:
-                # Try to get the current event loop
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # If we're in a running loop, create a new one
-                    response = asyncio.run_coroutine_threadsafe(
-                        asyncio.create_task(asyncio.to_thread(process_chat_message, chat_agent, message)),
-                        loop
-                    ).result(timeout=30)
-                else:
-                    # If no loop is running, run directly
-                    response = process_chat_message(chat_agent, message)
-            except RuntimeError:
-                # No event loop, run directly
-                response = process_chat_message(chat_agent, message)
+            response = process_chat_message(chat_agent, message)
             
             return jsonify({
                 "response": response,
