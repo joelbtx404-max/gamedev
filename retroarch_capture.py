@@ -304,6 +304,15 @@ def build_chat_agent(model_name: str) -> Agent:
     )
 
 
+def process_chat_message(agent: Agent, message: str) -> str:
+    """Process a chat message using the PokéAPI agent."""
+    run = Runner.run_sync(
+        agent,
+        input=message,
+    )
+    return extract_final_output(run)
+
+
 def build_analysis_prompt() -> str:
     """Return the base analysis prompt for frame evaluation."""
     return (
@@ -793,10 +802,26 @@ def _create_web_app(
                 return jsonify({"error": "No message provided"}), 400
             
             # Use the chat agent to process the message
-            response = chat_agent.run(message)
+            import asyncio
+            
+            try:
+                # Try to get the current event loop
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # If we're in a running loop, create a new one
+                    response = asyncio.run_coroutine_threadsafe(
+                        asyncio.create_task(asyncio.to_thread(process_chat_message, chat_agent, message)),
+                        loop
+                    ).result(timeout=30)
+                else:
+                    # If no loop is running, run directly
+                    response = process_chat_message(chat_agent, message)
+            except RuntimeError:
+                # No event loop, run directly
+                response = process_chat_message(chat_agent, message)
             
             return jsonify({
-                "response": response.content,
+                "response": response,
                 "timestamp": datetime.now().isoformat()
             })
         except Exception as e:
