@@ -14,8 +14,17 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional
 
 from dotenv import load_dotenv
-from flask import Flask, Response, render_template, stream_with_context
-from pokeapi_tool import fetch_pokemon_profile, pull_latest_pokemon_calls
+from flask import Flask, Response, render_template, stream_with_context, request, jsonify
+from pokeapi_tool import (
+    fetch_pokemon_profile, 
+    fetch_pokemon_gender,
+    fetch_pokemon_abilities,
+    fetch_pokemon_moves,
+    fetch_pokemon_types,
+    fetch_pokemon_items,
+    fetch_pokemon_locations,
+    pull_latest_pokemon_calls
+)
 
 try:
     from agents import Agent, ModelSettings, Runner
@@ -258,6 +267,41 @@ def build_agents(model_name: str) -> tuple[Agent, Agent]:
     summary_agent = Agent(name="GameSummarizer", instructions=summary_instructions)
 
     return analysis_agent, summary_agent
+
+
+def build_chat_agent(model_name: str) -> Agent:
+    """Create a PokéAPI chat agent with all available tools."""
+    
+    chat_instructions = (
+        "You are a helpful PokéAPI assistant that can answer questions about Pokémon using the PokéAPI. "
+        "You have access to various PokéAPI endpoints including:\n"
+        "- Pokémon profiles (stats, types, abilities, moves)\n"
+        "- Gender ratios\n"
+        "- Ability details\n"
+        "- Move information\n"
+        "- Type effectiveness\n"
+        "- Items and locations\n\n"
+        "Always use the appropriate tool to fetch data and provide comprehensive answers. "
+        "If a user asks about something not available in PokéAPI, politely explain the limitations. "
+        "Format your responses in a clear, conversational manner."
+    )
+    
+    return Agent(
+        name="PokéAPIChat",
+        instructions=chat_instructions,
+        tools=[
+            fetch_pokemon_profile,
+            fetch_pokemon_gender,
+            fetch_pokemon_abilities,
+            fetch_pokemon_moves,
+            fetch_pokemon_types,
+            fetch_pokemon_items,
+            fetch_pokemon_locations,
+        ],
+        model_settings=ModelSettings(
+            tool_choice="auto",
+        ),
+    )
 
 
 def build_analysis_prompt() -> str:
@@ -714,6 +758,9 @@ def _create_web_app(
     prompt: str,
 ) -> Flask:
     app = Flask(__name__)
+    
+    # Create chat agent
+    chat_agent = build_chat_agent(cfg["model"])
 
     def ensure_thread() -> None:
         start_capture_thread(cfg, analysis_agent, summary_agent, prompt)
@@ -732,6 +779,28 @@ def _create_web_app(
     def stream_summaries() -> Response:
         ensure_thread()
         return _event_response(summary_channel)
+
+    @app.route("/api/chat", methods=["POST"])
+    def chat_endpoint():
+        """Handle chat messages and return PokéAPI responses."""
+        try:
+            data = request.get_json()
+            if not data:
+                return jsonify({"error": "No JSON data provided"}), 400
+                
+            message = data.get("message", "")
+            if not message:
+                return jsonify({"error": "No message provided"}), 400
+            
+            # Use the chat agent to process the message
+            response = chat_agent.run(message)
+            
+            return jsonify({
+                "response": response.content,
+                "timestamp": datetime.now().isoformat()
+            })
+        except Exception as e:
+            return jsonify({"error": f"Chat error: {str(e)}"}), 500
 
     return app
 
