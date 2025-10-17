@@ -55,3 +55,6 @@ reference/
 
 # Agents file for codex
 AGENTS.md
+
+# audio files
+static/audio/

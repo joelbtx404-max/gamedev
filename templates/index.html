@@ -108,6 +108,10 @@
           <span id="chat-status" class="status-pill">Ready</span>
         </div>
         <div id="chat-container" class="chat-container">
+          <label class="chat-tts-toggle">
+            <input type="checkbox" id="chat-tts-toggle" />
+            <span>Auto play summaries (every 10 frames)</span>
+          </label>
           <div id="chat-messages" class="chat-messages"></div>
           <div class="chat-input-container">
             <input type="text" id="chat-input" placeholder="Ask about Pokémon..." />
@@ -146,11 +150,16 @@
       const chatSend = document.getElementById('chat-send');
       const chatMessages = document.getElementById('chat-messages');
       const chatStatus = document.getElementById('chat-status');
+      const chatTtsToggle = document.getElementById('chat-tts-toggle');
 
       const THEME_STORAGE_KEY = 'ui.theme.v1';
       const POKEDEX_STORAGE_KEY = 'pokedex.v1';
+      const CHAT_TTS_STORAGE_KEY = 'chat.tts.autoplay.v1';
       const MAX_POKEDEX_ENTRIES = 30;
       const POKEDEX_DISPLAY_STATS = ['hp', 'attack', 'defense', 'special-attack', 'special-defense', 'speed'];
+      const summaryAudioPlayer = new Audio();
+      summaryAudioPlayer.preload = 'auto';
+      let autoPlaySummaries = false;
 
       const prefersDarkScheme = window.matchMedia('(prefers-color-scheme: dark)');
       let activeTheme = resolveInitialTheme();
@@ -173,6 +182,26 @@
             return;
           }
           applyTheme(event.matches ? 'dark' : 'light');
+        });
+      }
+
+      if (chatTtsToggle) {
+        try {
+          const stored = localStorage.getItem(CHAT_TTS_STORAGE_KEY);
+          if (stored === 'true' || stored === 'false') {
+            chatTtsToggle.checked = stored === 'true';
+          }
+        } catch (err) {
+          console.warn('Failed to read chat TTS preference', err);
+        }
+        autoPlaySummaries = chatTtsToggle.checked;
+        chatTtsToggle.addEventListener('change', () => {
+          autoPlaySummaries = chatTtsToggle.checked;
+          try {
+            localStorage.setItem(CHAT_TTS_STORAGE_KEY, autoPlaySummaries ? 'true' : 'false');
+          } catch (err) {
+            console.warn('Failed to persist chat TTS preference', err);
+          }
         });
       }
 
@@ -474,6 +503,38 @@
         statusEl.dataset.tone = tone;
       }
 
+      function resolveStaticUrl(path) {
+        if (!path) {
+          return null;
+        }
+        if (path.startsWith('http://') || path.startsWith('https://')) {
+          return path;
+        }
+        return path.startsWith('/') ? path : `/${path}`;
+      }
+
+      function playSummaryAudioIfEnabled(payload) {
+        if (!autoPlaySummaries) {
+          return;
+        }
+        const audioPath = payload && payload.summary_audio;
+        if (!audioPath) {
+          return;
+        }
+        const resolved = resolveStaticUrl(audioPath);
+        if (!resolved) {
+          return;
+        }
+        try {
+          summaryAudioPlayer.pause();
+        } catch (err) {
+          // ignore pause errors
+        }
+        summaryAudioPlayer.currentTime = 0;
+        summaryAudioPlayer.src = `${resolved}?t=${Date.now()}`;
+        summaryAudioPlayer.play().catch(() => {});
+      }
+
       function attachStream(url, handler, statusEl) {
         const source = new EventSource(url);
         source.onmessage = handler;
@@ -570,6 +631,7 @@
 
         summaryContainer.prepend(item);
         trimChildren(summaryContainer, 20);
+        playSummaryAudioIfEnabled(payload);
       }
 
       // Chat functionality
