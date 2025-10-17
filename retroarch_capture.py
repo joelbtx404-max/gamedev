@@ -9,12 +9,14 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional
 
 from dotenv import load_dotenv
 from flask import Flask, Response, render_template, stream_with_context, request, jsonify
+from openai import OpenAI
 from pokeapi_tool import (
     fetch_pokemon_profile, 
     fetch_pokemon_gender,
@@ -34,6 +36,10 @@ except Exception as exc:  # pragma: no cover
 
 # Ensure environment variables from .env are available whenever this module is imported.
 load_dotenv()
+
+_tts_client_lock = threading.Lock()
+_tts_client: Optional[OpenAI] = None
+_tts_format_warning_shown = False
 
 
 def load_config():
@@ -68,6 +74,11 @@ def load_config():
         "ui_host": os.getenv("STREAM_UI_HOST", "0.0.0.0"),
         "ui_port": ui_port,
         "summary_interval": summary_interval,
+        "audio_dir": Path(os.getenv("SUMMARY_AUDIO_DIR", str(Path(__file__).resolve().parent / "static" / "audio"))).resolve(),
+        "tts_model": os.getenv("SUMMARY_TTS_MODEL", "gpt-4o-mini-tts"),
+        "tts_voice": os.getenv("SUMMARY_TTS_VOICE", "coral"),
+        "tts_format": os.getenv("SUMMARY_TTS_FORMAT", "mp3"),
+        "tts_enabled": os.getenv("SUMMARY_TTS_ENABLED", "1") not in {"0", "false", "False"},
     }
     missing = [k for k in ("api_key",) if not cfg[k]]
     if missing:
@@ -358,11 +369,78 @@ def _emit(handlers: Iterable[Callable[[dict[str, Any]], None]], payload: dict[st
 
 
 def _relative_image_path(path: Path) -> str:
+    return _relative_static_path(path)
+
+
+def _relative_static_path(path: Path) -> str:
     try:
         rel = path.relative_to(Path(__file__).resolve().parent)
         return str(rel).replace(os.sep, "/")
     except ValueError:
         return str(path)
+
+
+def _get_tts_client(api_key: Optional[str], base_url: Optional[str]) -> Optional[OpenAI]:
+    global _tts_client
+    with _tts_client_lock:
+        if _tts_client is None:
+            client_kwargs: Dict[str, Any] = {}
+            if api_key:
+                client_kwargs["api_key"] = api_key
+            if base_url:
+                client_kwargs["base_url"] = base_url
+            try:
+                _tts_client = OpenAI(**client_kwargs)
+            except Exception as exc:  # pragma: no cover
+                print(f"Failed to initialize OpenAI audio client: {exc}", file=sys.stderr)
+                return None
+        return _tts_client
+
+
+def _warn_tts_format(detected: str, fallback: str) -> None:
+    global _tts_format_warning_shown
+    if _tts_format_warning_shown:
+        return
+    print(f"SUMMARY_TTS_FORMAT '{detected}' not supported; defaulting to '{fallback}'.")
+    _tts_format_warning_shown = True
+
+
+def synthesize_summary_audio(summary_text: str, cfg: dict[str, Any]) -> Optional[str]:
+    """Generate a speech file for the provided summary text and return a static-relative path."""
+    if not summary_text or not summary_text.strip():
+        return None
+
+    if not cfg.get("tts_enabled", True):
+        return None
+
+    client = _get_tts_client(cfg.get("api_key"), cfg.get("base_url"))
+    if client is None:
+        return None
+
+    audio_dir = Path(cfg.get("audio_dir"))
+    ensure_out_dir(audio_dir, clear=False)
+
+    requested_format = (cfg.get("tts_format") or "mp3").lower() or "mp3"
+    extension = "mp3"
+    if requested_format != "mp3":
+        _warn_tts_format(requested_format, extension)
+    filename = f"summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.{extension}"
+    out_path = audio_dir / filename
+
+    request_args: Dict[str, Any] = {
+        "model": cfg.get("tts_model") or "gpt-4o-mini-tts",
+        "voice": cfg.get("tts_voice") or "coral",
+        "input": summary_text.strip(),
+    }
+
+    try:
+        with client.audio.speech.with_streaming_response.create(**request_args) as response:
+            response.stream_to_file(out_path)
+    except Exception as exc:  # pragma: no cover
+        print(f"Failed to synthesize summary audio: {exc}", file=sys.stderr)
+        return None
+
+    return _relative_static_path(out_path)
 
 
 def _default_analysis_handler(payload: dict[str, Any]) -> None:
@@ -574,6 +652,8 @@ def run_capture_loop(
     cumulative_summary = ""
     last_summary_len = 0
 
+    ensure_out_dir(cfg["audio_dir"], clear=False)
+
     while True:
         if stop_event is not None and hasattr(stop_event, "is_set"):
             try:
@@ -712,6 +792,9 @@ def run_capture_loop(
                             "interval": summary_interval,
                             "cumulative": True,
                         }
+                        summary_audio = synthesize_summary_audio(cumulative_summary, cfg)
+                        if summary_audio:
+                            summary_payload["summary_audio"] = summary_audio
                         _emit(handlers_summary, summary_payload)
                     except Exception as exc:
                         _emit(
@@ -845,6 +928,7 @@ def serve_web_app(
         prompt = build_analysis_prompt()
 
     ensure_out_dir(cfg["out_dir"], clear=True)
+    ensure_out_dir(cfg["audio_dir"], clear=False)
 
     host = cfg["ui_host"]
     port = cfg["ui_port"]
@@ -862,6 +946,7 @@ def create_app() -> Flask:
 
     cfg = load_config()
     ensure_out_dir(cfg["out_dir"], clear=True)
+    ensure_out_dir(cfg["audio_dir"], clear=False)
     analysis_agent, summary_agent = build_agents(cfg["model"])
     prompt = build_analysis_prompt()
 
@@ -904,6 +989,7 @@ def main() -> None:
         return
 
     ensure_out_dir(cfg["out_dir"], clear=True)
+    ensure_out_dir(cfg["audio_dir"], clear=False)
 
     print(f"Capturing from app: {cfg['app_name']} every {cfg['interval']}s using model {cfg['model']}")
     print(f"Saving screenshots to: {cfg['out_dir']}")
