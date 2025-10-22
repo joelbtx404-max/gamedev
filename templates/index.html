@@ -122,14 +122,6 @@
 
       <section class="panel">
         <div class="panel-heading">
-          <h2>Frame Analyses</h2>
-          <span id="analysis-status" class="status-pill">Connecting…</span>
-        </div>
-        <div id="analysis-stream" class="stream"></div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-heading">
           <h2>Summaries</h2>
           <span id="summary-status" class="status-pill">Connecting…</span>
         </div>
@@ -494,11 +486,10 @@
         }
       }
 
-      function containerFor(url) {
-        return url.includes('summary') ? summaryContainer : analysisContainer;
-      }
-
       function setStatus(statusEl, text, tone) {
+        if (!statusEl) {
+          return;
+        }
         statusEl.textContent = text;
         statusEl.dataset.tone = tone;
       }
@@ -545,12 +536,17 @@
 
       function renderAnalysis(event) {
         const payload = JSON.parse(event.data);
-        const item = document.createElement('article');
-        item.className = 'stream-item';
 
         if (payload.meta && payload.meta.latest_calls) {
           applyLatestCalls(payload.meta.latest_calls);
         }
+
+        if (!analysisContainer) {
+          return;
+        }
+
+        const item = document.createElement('article');
+        item.className = 'stream-item';
 
         const header = document.createElement('div');
         header.className = 'stream-header';
@@ -579,9 +575,6 @@
             item.appendChild(participants);
           }
 
-          const jsonBlock = document.createElement('pre');
-          jsonBlock.textContent = JSON.stringify(payload.data, null, 2);
-          item.appendChild(jsonBlock);
         } else if (payload.type === 'analysis_error') {
           badge.textContent = 'Error';
           badge.classList.add('error');
