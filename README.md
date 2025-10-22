@@ -23,8 +23,8 @@ RetroArch Analysis Stream captures live RetroArch gameplay on macOS, routes each
 Clone the repository and install dependencies into a virtual environment:
 
 ```bash
-git clone https://github.com/joelb/retroarch-analysis-stream.git
-cd retroarch-analysis-stream
+git clone https://github.com/joelb/game_analyzer.git
+cd game_analyzer
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -107,7 +107,7 @@ All payload formats are stable and match the structures used by the existing fro
 ## Project Layout
 
 ```
-retroarch-analysis-stream/
+game_analyzer/
 ├── retroarch_capture.py     # Capture loop, Agents pipeline, web factory
 ├── web_app.py               # Flask entrypoint for hosting
 ├── chat_app.py              # Standalone chat service
