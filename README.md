@@ -1,162 +1,142 @@
-# RetroArch Game Analyzer
+# RetroArch Analysis Stream
 
-Capture RetroArch gameplay on macOS, analyze each frame with the OpenAI Agents SDK, and stream results through a live web UI and Pokedex-aware chat experience. The capture loop, streaming server, and chat workflow now run independently so the chat endpoint stays responsive even when the capture service is offline.
+RetroArch Analysis Stream captures live RetroArch gameplay on macOS, routes each frame through the OpenAI Agents SDK, and serves real-time insights through a lightweight Flask dashboard. The web UI focuses on live summaries, a Pokédex that persists recent sightings, and a chat endpoint that can run independently of the capture loop. The project is published under the MIT License and is intended for open-source experimentation.
 
-## Key Capabilities
+## Features
 
 - Automated RetroArch window capture with macOS AppleScript fallbacks.
-- Frame-by-frame analysis and summaries driven by OpenAI Agents and the PokeAPI helper tools.
-- Streaming Server-Sent Events feeds for analyses (`/stream/analysis`) and summaries (`/stream/summaries`).
-- Built-in PokeAPI chat endpoint (`/api/chat`) that shares the same agent stack but no longer depends on the capture thread's asyncio loop.
-- Dark-mode web dashboard with live analysis cards, rolling summaries, and a persistent Pokedex sidebar.
-- Standalone Flask wrapper (`chat_app.py`) for lightweight chat-only deployments.
+- Frame analysis and battle summaries generated with OpenAI Agents plus PokéAPI helper tools.
+- Streaming Server-Sent Events feeds for raw analyses (`/stream/analysis`) and aggregated summaries (`/stream/summaries`).
+- Responsive web dashboard (vanilla JS + CSS) with dark/light theming and accent colors (`#FACC15`, `#2563EB`) tuned for accessible contrast.
+- Built-in Pokédex cache that updates when the analysis stream reports new combatants.
+- Standalone chat microservice (`chat_app.py`) that reuses the same agent stack without depending on the capture thread.
 
-## Requirements
+## Prerequisites
 
-- macOS with accessibility permissions for your terminal or IDE (AppleScript + `screencapture`).
+- macOS with screen recording and accessibility permissions granted to your terminal/IDE.
 - Python 3.11 or newer.
-- An OpenAI API key (or compatible API key/base URL).
-- Optional: RetroArch running with a visible window for capture tests.
+- An OpenAI-compatible API key (set via `OPENAI_API_KEY`).
+- RetroArch running in a visible window if you want to exercise the capture pipeline.
 
-## Quick Start
+## Getting Started
 
-1. **Create a virtual environment and install dependencies**
-   ```bash
-   cd game_analyzer
-   python -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt
-   ```
+Clone the repository and install dependencies into a virtual environment:
 
-2. **Configure environment variables**
+```bash
+git clone https://github.com/joelb/retroarch-analysis-stream.git
+cd retroarch-analysis-stream
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-   Copy your local secrets file if you keep one (for example `cp .env.local .env`) and populate at least:
+Create a `.env` file (copy from any local template if you have one) and populate at least:
 
-   ```
-   OPENAI_API_KEY=sk-...
-   # Optional overrides:
-   # MODEL=gpt-4o
-   # OPENAI_BASE_URL=https://api.openai.com/v1
-   # CAPTURE_SOURCE=RetroArch
-   # SCREENSHOT_INTERVAL_SECONDS=2
-   # SUMMARY_INTERVAL=5
-   # STREAM_UI_PORT=5050
-   ```
+```
+OPENAI_API_KEY=sk-...
+# Optional overrides
+# MODEL=gpt-5
+# OPENAI_BASE_URL=https://api.openai.com/v1
+# CAPTURE_SOURCE=RetroArch
+# SCREENSHOT_INTERVAL_SECONDS=2
+# SUMMARY_INTERVAL=5
+# STREAM_UI_PORT=5050
+```
 
-   All services load `.env` automatically through `python-dotenv`.
+## Running the Services
 
-3. **Verify window detection (recommended on first run)**
-   ```bash
-   python test_window_detection.py
-   ```
+- **Capture loop only**  
+  ```bash
+  python retroarch_capture.py
+  ```
 
-4. **Choose a runtime mode**
+- **Capture loop + web dashboard**  
+  ```bash
+  python retroarch_capture.py --web
+  # Visit http://localhost:5050 (configurable via STREAM_UI_HOST/PORT)
+  ```
 
-   - Terminal capture loop with console logging:
-     ```bash
-     python retroarch_capture.py
-     ```
-   - Web streaming UI (live dashboard + chat):
-     ```bash
-     python retroarch_capture.py --web
-     # Visit http://localhost:5050 (or your STREAM_UI_HOST/PORT)
-     ```
-   - Chat-only microservice:
-     ```bash
-     python chat_app.py
-     # POST {"message": "..."} to http://localhost:5052/api/chat
-     ```
+- **Chat-only microservice**  
+  ```bash
+  python chat_app.py
+  # POST {"message": "..."} to http://localhost:5052/api/chat
+  ```
 
-## Runtime Overview
+- **Flask entrypoint for production hosting**  
+  ```bash
+  python web_app.py
+  # or FLASK_APP=web_app.py flask run
+  ```
 
-- **Capture loop** - runs in its own daemon thread and drives screenshot capture, Agent analysis, and summary generation. Screenshots land in `static/images` by default.
-- **Streaming API** - the Flask app exposes two SSE endpoints (`/stream/analysis`, `/stream/summaries`) that the web dashboard and other clients can consume.
-- **Chat service** - `POST /api/chat` responds with PokeAPI-backed insights using the shared agent configuration. The handler now works from any request thread without requiring access to the capture thread's asyncio loop.
-- **Standalone web entrypoint** - `python web_app.py` (or `FLASK_APP=web_app.py flask run`) launches the same dashboard for hosting scenarios that rely on Flask's CLI.
+The web UI renders live summaries and Pokédex updates. The raw analysis stream is still available at `/stream/analysis` for external clients even though the default UI omits the frame cards.
 
-## Configuration Reference (`.env`)
+## Configuration Reference
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `OPENAI_API_KEY` | Required API key for the Agents SDK | _none_ |
-| `OPENAI_BASE_URL` | Alternate API base (OpenAI-compatible) | `https://api.openai.com/v1` |
-| `MODEL` | Agents model id | `gpt-5` |
-| `CAPTURE_SOURCE` | macOS process/window name to target | `RetroArch` |
+| `OPENAI_API_KEY` | Required API key | _none_ |
+| `OPENAI_BASE_URL` | Alternate OpenAI-compatible base URL | `https://api.openai.com/v1` |
+| `MODEL` | Primary agent model | `gpt-5` |
+| `CAPTURE_SOURCE` | macOS window title to target | `RetroArch` |
 | `SCREENSHOT_INTERVAL_SECONDS` | Seconds between captures | `2` |
 | `SCREENSHOTS_DIR` | Output directory for screenshots | `static/images` |
-| `SUMMARY_INTERVAL` or `SUMMARY_EVERY` | Captures between summaries | `5` |
-| `STREAM_UI_HOST` | Host for the web UI | `0.0.0.0` |
-| `STREAM_UI_PORT` / `WEB_APP_PORT` | Port for the web UI | `5050` |
+| `SUMMARY_INTERVAL` / `SUMMARY_EVERY` | Captures per summary event | `5` |
+| `STREAM_UI_HOST` | Bind address for dashboard | `0.0.0.0` |
+| `STREAM_UI_PORT` / `WEB_APP_PORT` | Port for dashboard | `5050` |
 | `CHAT_PORT` | Port when running `chat_app.py` | `5052` |
 | `POKEAPI_TOOL_DEBUG` | Set to `1` to log tool traffic | unset |
-| `SUMMARY_TTS_ENABLED` | Toggle summary text-to-speech synthesis | `1` |
-| `SUMMARY_TTS_MODEL` | OpenAI model used for summary speech | `gpt-4o-mini-tts` |
-| `SUMMARY_TTS_VOICE` | Voice preset for summary speech | `coral` |
-| `SUMMARY_TTS_FORMAT` | Desired audio format (falls back to mp3 currently) | `mp3` |
+| `SUMMARY_TTS_ENABLED` | Enable summary speech synthesis | `1` |
+| `SUMMARY_TTS_MODEL` | OpenAI model for speech | `gpt-4o-mini-tts` |
+| `SUMMARY_TTS_VOICE` | Speech voice preset | `coral` |
+| `SUMMARY_TTS_FORMAT` | Output audio format | `mp3` |
 
-## API & Event Payloads
+## API & Streaming Endpoints
 
-- **`POST /api/chat`** - `{ "message": "Who is Pikachu weak against?" }` -> `{ "response": "...", "timestamp": "..." }`
-- **SSE `/stream/analysis`** - emits structured JSON payloads with battle detection metadata and relative screenshot paths.
-- **SSE `/stream/summaries`** - fires every `SUMMARY_INTERVAL` captures with a concise progress narrative.
+- `POST /api/chat`  
+  Request: `{"message": "Who counters Bulbasaur?"}`  
+  Response: `{"response": "...", "timestamp": "2024-10-22T12:34:56Z"}`
 
-All endpoints preserve their previous response shapes so existing clients continue to work.
+- `GET /stream/analysis` (SSE)  
+  Emits frame-level analysis objects with metadata and relative asset paths.
 
-## Output Schema
+- `GET /stream/summaries` (SSE)  
+  Emits narrative recaps every `SUMMARY_INTERVAL` captures and includes optional audio references when TTS is enabled.
 
-Example frame analysis:
-```json
-{
-  "game_name": "Pokemon Black",
-  "scene": "battle",
-  "characters": [
-    {
-      "name": "Tepig",
-      "level": 6,
-      "hp_current": 21,
-      "hp_max": 25,
-      "status": "normal"
-    }
-  ],
-  "environment": "grassy field",
-  "notable_events": "Player's turn to select action"
-}
-```
-
-Summaries are short natural-language recaps keyed to the same capture cadence.
-
-## Troubleshooting
-
-- **"RetroArch window not found"** - ensure RetroArch is visible, run `python test_window_detection.py`, or set `CAPTURE_SOURCE` to the correct process name. The capture loop falls back to full-screen grabs if bounds cannot be resolved.
-- **"Chat error: There is no current event loop..."** - update to the latest code (this README) which initializes a loop inside the chat worker when needed.
-- **Permission errors** - macOS may prompt for screen recording and accessibility access; enable Terminal/IDE in System Settings -> Privacy & Security.
-- **Unexpected JSON** - enable `POKEAPI_TOOL_DEBUG=1` to log agent tool calls and inspect the raw responses in the console.
-
-## Testing
-
-- Run the lightweight chat regression test:
-  ```bash
-  python test_chat.py
-  ```
-- Additional window detection checks live in `test_window_detection.py`. The capture loop relies on live screenshots, so no full unit suite exists yet.
+All payload formats are stable and match the structures used by the existing frontend.
 
 ## Project Layout
 
 ```
-game_analyzer/
-|--- retroarch_capture.py   # Capture loop, Agents pipeline, web factory
-|--- web_app.py             # Gunicorn/Flask entrypoint
-|--- chat_app.py            # Standalone chat microservice
-|--- pokeapi_tool.py        # PokeAPI tool wrappers used by Agents
-|--- templates/index.html   # Streaming dashboard UI
-|--- static/                # CSS, JS, image output
-|--- test_chat.py           # Chat regression helper
-|--- test_window_detection.py
-`--- README.md
+retroarch-analysis-stream/
+├── retroarch_capture.py     # Capture loop, Agents pipeline, web factory
+├── web_app.py               # Flask entrypoint for hosting
+├── chat_app.py              # Standalone chat service
+├── pokeapi_tool.py          # PokéAPI tool wrappers for Agents
+├── templates/index.html     # Dashboard template
+├── static/                  # CSS, audio assets, placeholder imagery
+├── test_chat.py             # Chat regression helper
+├── test_window_detection.py # AppleScript window detection helper
+└── README.md
 ```
 
-## Next Steps
+## Development & Testing
 
-1. Populate `.env` with your `OPENAI_API_KEY`.
-2. Launch `python retroarch_capture.py --web` and watch the dashboard populate while RetroArch runs.
-3. Exercise `POST /api/chat` to confirm the chat service responds independently of the capture loop.
+Automated tests are minimal because the capture loop relies on screen access, but you can run the helpers:
+
+```bash
+python test_chat.py              # Exercises the chat pipeline
+python test_window_detection.py  # Confirms RetroArch window detection
+```
+
+If you add pytest-based suites, install `pytest` in your environment and run `python -m pytest`.
+
+## Troubleshooting
+
+- **RetroArch window not found** – ensure RetroArch is visible, run `python test_window_detection.py`, or adjust `CAPTURE_SOURCE`.
+- **Permission errors** – grant screen recording and accessibility rights under System Settings → Privacy & Security.
+- **Unexpected agent output** – set `POKEAPI_TOOL_DEBUG=1` to log tool traffic and inspect raw responses.
+- **Chat endpoint down** – confirm the API key is set; the chat workflow runs independently of the capture loop, so you can debug it without live gameplay.
+
+## License
+
+This project is released under the [MIT License](LICENSE). Contributions are welcome via pull requests or issues.
